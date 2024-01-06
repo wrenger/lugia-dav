@@ -1,0 +1,19 @@
+[package]
+name = "lugia-dav"
+version = "0.1.0"
+edition = "2021"
+default-run = "lugia-dav"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+dav-server = { version = "0.5", features = ["warp-compat"] }
+clap = { version = "4.4", features = ["derive"] }
+tokio = { version = "1.35", features = ["full"] }
+warp = { version = "0.3", features = ["tls"] }
+env_logger = "0.10"
+base64 = "0.21"
+sha2 = "0.10"
+log = "0.4"
+hex = "0.4"
+rand = "0.8"

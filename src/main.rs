@@ -6,8 +6,11 @@ use std::str::FromStr;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use clap::Parser;
 use dav_server::warp::dav_dir;
+use futures_util::TryFutureExt;
 use log::error;
 use sha2::{Digest, Sha256};
+use warp::filters::compression;
+use warp::http::StatusCode;
 use warp::reject::{self, InvalidHeader, MissingHeader, Rejection};
 use warp::reply::{Reply, WithHeader};
 use warp::Filter;
@@ -54,8 +57,9 @@ async fn main() {
         warp::any()
             .and(auth(salt, hash))
             .and(dav)
-            .map(|_, dav| dav)
-            .recover(handle_rejection),
+            .map(|_, dav| www_auth(dav))
+            .recover(|e| handle_rejection(e).map_ok(www_auth))
+            .with(compression::gzip()),
     )
     .tls()
     .cert_path(cert)
@@ -71,7 +75,7 @@ fn auth(salt: Vec<u8>, hash: Vec<u8>) -> impl Filter<Extract = ((),), Error = Re
         let salt = salt.to_owned();
         let hash = hash.to_owned();
         async move {
-            if valid(&salt, &hash, &auth.userpass).is_ok() {
+            if valid(&salt, &hash, &auth.0).is_ok() {
                 Ok(())
             } else {
                 Err(reject::custom(AuthError))
@@ -80,10 +84,10 @@ fn auth(salt: Vec<u8>, hash: Vec<u8>) -> impl Filter<Extract = ((),), Error = Re
     })
 }
 
-fn valid(salt: &[u8], hash: &[u8], auth: &str) -> Result<(), AuthError> {
+fn valid(salt: &[u8], hash: &[u8], userpass: &str) -> Result<(), AuthError> {
     let mut hasher = Sha256::new();
     hasher.update(salt);
-    hasher.update(auth);
+    hasher.update(userpass);
     let new = hasher.finalize();
 
     if hash == new.as_slice() {
@@ -93,15 +97,8 @@ fn valid(salt: &[u8], hash: &[u8], auth: &str) -> Result<(), AuthError> {
     }
 }
 
-#[derive(Debug)]
-struct AuthError;
-
-impl reject::Reject for AuthError {}
-
 #[derive(Debug, Clone)]
-struct BasicAuth {
-    userpass: String,
-}
+struct BasicAuth(String);
 
 impl FromStr for BasicAuth {
     type Err = AuthError;
@@ -110,9 +107,14 @@ impl FromStr for BasicAuth {
         let s = s.strip_prefix("Basic ").ok_or(AuthError)?;
         let decode = BASE64.decode(s).map_err(|_| AuthError)?;
         let userpass = String::from_utf8(decode).map_err(|_| AuthError)?;
-        Ok(BasicAuth { userpass })
+        Ok(BasicAuth(userpass))
     }
 }
+
+#[derive(Debug)]
+struct AuthError;
+
+impl reject::Reject for AuthError {}
 
 fn www_auth<T: Reply>(r: T) -> WithHeader<T> {
     warp::reply::with_header(
@@ -123,35 +125,25 @@ fn www_auth<T: Reply>(r: T) -> WithHeader<T> {
 }
 
 async fn handle_rejection(err: Rejection) -> Result<impl Reply, Infallible> {
-    Ok(www_auth('out: {
-        if err.is_not_found() {
-            break 'out warp::reply::with_status("Not Found", warp::http::StatusCode::NOT_FOUND);
-        } else if let Some(h) = err.find::<MissingHeader>() {
-            if h.name() == "Authorization" {
-                break 'out warp::reply::with_status(
-                    "Unauthorized",
-                    warp::http::StatusCode::UNAUTHORIZED,
-                );
-            }
-        } else if let Some(h) = err.find::<InvalidHeader>() {
-            error!("InvalidHeader: {h:?}");
-            if h.name() == "Authorization" {
-                break 'out warp::reply::with_status(
-                    "Unauthorized",
-                    warp::http::StatusCode::UNAUTHORIZED,
-                );
-            }
-        } else if let Some(_) = err.find::<AuthError>() {
-            break 'out warp::reply::with_status(
-                "Unauthorized",
-                warp::http::StatusCode::UNAUTHORIZED,
-            );
-        }
+    let unauthorized = || warp::reply::with_status("Unauthorized", StatusCode::UNAUTHORIZED);
 
-        error!("unhandled rejection: {err:?}");
-        warp::reply::with_status(
-            "Internal Server Error",
-            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
-        )
-    }))
+    if err.is_not_found() {
+        return Ok(warp::reply::with_status("Not Found", StatusCode::NOT_FOUND));
+    } else if let Some(h) = err.find::<MissingHeader>() {
+        if h.name() == "Authorization" {
+            return Ok(unauthorized());
+        }
+    } else if let Some(h) = err.find::<InvalidHeader>() {
+        if h.name() == "Authorization" {
+            return Ok(unauthorized());
+        }
+    } else if err.find::<AuthError>().is_some() {
+        return Ok(unauthorized());
+    }
+
+    error!("unhandled rejection: {err:?}");
+    Ok(warp::reply::with_status(
+        "Internal Server Error",
+        StatusCode::INTERNAL_SERVER_ERROR,
+    ))
 }

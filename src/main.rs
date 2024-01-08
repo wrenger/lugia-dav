@@ -9,7 +9,6 @@ use dav_server::warp::dav_dir;
 use futures_util::TryFutureExt;
 use log::error;
 use sha2::{Digest, Sha256};
-use warp::filters::compression;
 use warp::http::StatusCode;
 use warp::reject::{self, InvalidHeader, MissingHeader, Rejection};
 use warp::reply::{Reply, WithHeader};
@@ -58,8 +57,7 @@ async fn main() {
             .and(auth(salt, hash))
             .and(dav)
             .map(|_, dav| www_auth(dav))
-            .recover(|e| handle_rejection(e).map_ok(www_auth))
-            .with(compression::gzip()),
+            .recover(|e| handle_rejection(e).map_ok(www_auth)),
     )
     .tls()
     .cert_path(cert)

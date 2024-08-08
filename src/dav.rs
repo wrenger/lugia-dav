@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use chrono::{DateTime, Utc};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize, Serializer};
 use std::fs::DirEntry;
@@ -26,7 +27,7 @@ pub enum Error {
 }
 
 #[derive(Clone, Copy)]
-struct HeaderValue(&'static str);
+pub struct HeaderValue(&'static str);
 impl PartialEq<HeaderField> for HeaderValue {
     fn eq(&self, other: &HeaderField) -> bool {
         other.equiv(self.0)
@@ -48,12 +49,13 @@ impl PartialEq<HeaderValue> for str {
     }
 }
 
-const ALLOW: HeaderValue = HeaderValue("allow");
-const DEPTH: HeaderValue = HeaderValue("depth");
-const OVERWRITE: HeaderValue = HeaderValue("overwrite");
-const DESTINATION: HeaderValue = HeaderValue("destination");
-const UPDATE_RANGE: HeaderValue = HeaderValue("x-update-range");
-const CONTENT_TYPE: HeaderValue = HeaderValue("content-type");
+pub const ALLOW: HeaderValue = HeaderValue("allow");
+pub const DEPTH: HeaderValue = HeaderValue("depth");
+pub const OVERWRITE: HeaderValue = HeaderValue("overwrite");
+pub const DESTINATION: HeaderValue = HeaderValue("destination");
+pub const UPDATE_RANGE: HeaderValue = HeaderValue("x-update-range");
+pub const CONTENT_TYPE: HeaderValue = HeaderValue("content-type");
+pub const LITMUS: HeaderValue = HeaderValue("x-litmus");
 
 impl Error {
     fn not_found() -> Self {
@@ -86,24 +88,37 @@ impl WebDav {
     }
 
     pub fn handle(&self, rq: &mut Request) -> Result<ResponseBox, Error> {
-        info!("{rq:?}");
+        info!(
+            "{rq:?}\n{:?}",
+            rq.headers()
+                .iter()
+                .map(|h| h.to_string())
+                .collect::<Vec<_>>()
+        );
+
         let path = rq.url().strip_prefix('/').unwrap_or(rq.url());
         let path = self.dir.join(path);
 
+        // Some operations can be executed on the root
+        let valid_root =
+            matches!(rq.method().as_str(), "GET" | "PROPFIND" | "PROPPATCH") && path == self.dir;
+
         // Ensure that the path is within the directory
-        let parent = match path.parent().ok_or(status::FORBIDDEN)?.canonicalize() {
-            Ok(parent) => parent,
-            Err(e) => {
-                if rq.method().as_str() == "MKCOL" {
-                    // MKCOL with missing parent is a conflict
-                    return Err(status::CONFLICT.into());
+        if !valid_root {
+            let parent = match path.parent().ok_or(status::FORBIDDEN)?.canonicalize() {
+                Ok(parent) => parent,
+                Err(e) => {
+                    if rq.method().as_str() == "MKCOL" {
+                        // MKCOL with missing parent is a conflict
+                        return Err(status::CONFLICT.into());
+                    }
+                    return Err(e.into());
                 }
-                return Err(e.into());
+            };
+            // Prevent directory traversal
+            if !parent.starts_with(&self.dir) {
+                return Err(status::FORBIDDEN.into());
             }
-        };
-        // Prevent directory traversal
-        if !parent.starts_with(&self.dir) {
-            return Err(status::FORBIDDEN.into());
         }
 
         let reader = rq.as_reader();
@@ -117,6 +132,11 @@ impl WebDav {
                 return Err(status::BAD_REQUEST.into());
             }
             body.extend(&buffer[0..len]);
+        }
+
+        match rq.method().as_str() {
+            "PROPFIND" | "PROPPATCH" => info!("- {:?}", String::from_utf8(body.clone())),
+            _ => {}
         }
 
         // Ensure that the body is not empty for methods that require it
@@ -300,9 +320,13 @@ impl WebDav {
     ) -> Result<ResponseBox, Error> {
         let mut out = MultiStatus::new();
 
-        let body = String::from_utf8(body).map_err(|_| Error::XML)?;
-        let propfind: PropFind = quick_xml::de::from_str(&body)?;
-        info!("propfind: {propfind:?}");
+        let _propfind = if !body.is_empty() {
+            let body = String::from_utf8(body).map_err(|_| Error::XML)?;
+            info!("propfind: {body:?}");
+            quick_xml::de::from_str(&body)?
+        } else {
+            PropFind::default()
+        };
 
         let meta = std::fs::metadata(&path)?;
         if meta.is_dir() {
@@ -321,7 +345,6 @@ impl WebDav {
                     .push(PropResponse::new(&path, &meta, &self.dir)?)
             } else {
                 let mut stream = read_dir_rec(&path, depth)?;
-                info!("rec {stream:?}");
                 while let Some(entry) = stream.pop() {
                     out.response.push(PropResponse::new(
                         &entry.path(),
@@ -343,7 +366,6 @@ impl WebDav {
             "<?xml version=\"1.0\" encoding=\"utf-8\" ?>{}",
             quick_xml::se::to_string(&out)?
         );
-        info!("{out}");
         Ok(Response::from_string(out)
             .with_header(
                 Header::from_bytes(CONTENT_TYPE.0, b"text/xml; charset=\"utf-8\"").unwrap(),
@@ -559,20 +581,21 @@ fn byte_range(range: &str, len: u64) -> Option<(u64, u64)> {
     }
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, Default)]
 #[serde(rename = "propfind")]
 struct PropFind {
     #[serde(rename = "$value")]
     propfind: PropFindInner,
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, Default)]
 #[serde(rename_all = "lowercase")]
 enum PropFindInner {
     Prop {
         #[serde(rename = "$value")]
         props: Vec<PropFindKind>,
     },
+    #[default]
     AllProp,
 }
 
@@ -634,10 +657,12 @@ struct Prop {
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "lowercase")]
 enum PropKind {
+    CreationDate(String),
     DisplayName(String),
-    ResourceType(Option<PropCollection>),
     GetContentLength(u64),
-    GetLastModified(u64),
+    GetContentType(String),
+    GetLastModified(String),
+    ResourceType(Option<PropCollection>),
 }
 
 #[derive(Serialize, Debug)]
@@ -652,22 +677,24 @@ impl PropResponse {
             propstat: PropStat {
                 prop: Prop {
                     prop: vec![
+                        PropKind::CreationDate(date_str(meta.created()?)),
                         PropKind::DisplayName(
                             path.file_name()
                                 .and_then(|n| n.to_str())
                                 .unwrap_or_default()
                                 .into(),
                         ),
+                        PropKind::GetContentLength(meta.len()),
+                        PropKind::GetContentType(
+                            mime_guess::from_path(&path)
+                                .first_or_text_plain()
+                                .as_ref()
+                                .into(),
+                        ),
                         PropKind::ResourceType(
                             meta.is_dir().then_some(PropCollection { collection: () }),
                         ),
-                        PropKind::GetContentLength(meta.len()),
-                        PropKind::GetLastModified(
-                            meta.modified()?
-                                .duration_since(SystemTime::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis() as u64,
-                        ),
+                        PropKind::GetLastModified(date_str(meta.modified()?)),
                     ],
                 },
                 status: status::OK,
@@ -685,8 +712,13 @@ fn normalize_path(path: &Path) -> String {
     }
 }
 
+fn date_str(time: SystemTime) -> String {
+    DateTime::<Utc>::from(time).to_rfc3339()
+}
+
 #[cfg(test)]
 mod test {
+    use chrono::DateTime;
     use std::path::Path;
 
     use crate::dav::PropFind;
@@ -720,7 +752,9 @@ mod test {
             .unwrap()
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .unwrap()
-            .as_millis();
+            .as_secs();
+        let mtime = DateTime::from_timestamp(mtime as _, 0).unwrap();
+
         assert_eq!(
             xml,
             format!(
@@ -728,9 +762,10 @@ mod test {
                 <displayname>src</displayname>\
                 <resourcetype><collection/></resourcetype>\
                 <getcontentlength>{}</getcontentlength>\
-                <getlastmodified>{mtime}</getlastmodified>\
+                <getlastmodified>{}</getlastmodified>\
                 </prop><status>HTTP/1.1 200 OK</status></propstat></PropResponse>",
-                meta.len()
+                meta.len(),
+                mtime.to_rfc3339()
             )
         );
     }

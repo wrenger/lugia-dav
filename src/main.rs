@@ -9,9 +9,9 @@ use std::thread::{self, available_parallelism};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use clap::Parser;
 use dav::{Error, WebDav};
-use log::{error, info};
+use log::{error, info, trace};
 use sha2::{Digest, Sha256};
-use tiny_http::{Header, Request, Response, Server, SslConfig, StatusCode};
+use tiny_http::{Header, Request, Response, Server, SslConfig};
 
 mod dav;
 
@@ -24,6 +24,7 @@ mod status {
     pub const MULTI_STATUS: StatusCode = StatusCode(207);
 
     pub const BAD_REQUEST: StatusCode = StatusCode(400);
+    pub const UNAUTHORIZED: StatusCode = StatusCode(401);
     pub const FORBIDDEN: StatusCode = StatusCode(403);
     pub const NOT_FOUND: StatusCode = StatusCode(404);
     pub const METHOD_NOT_ALLOWED: StatusCode = StatusCode(405);
@@ -77,7 +78,7 @@ fn main() {
         private_key: fs::read(key).expect("no ssl private key"),
     };
 
-    let server = tiny_http::Server::https(host, ssl).expect("Invalid host or ssl");
+    let server = tiny_http::Server::https(host, ssl).expect("invalid host or ssl");
     let running = AtomicBool::new(true);
     start(&server, |rq| authenticate(rq, &salt, &hash), &dir, &running);
 }
@@ -116,7 +117,9 @@ fn authenticate(rq: Request, salt: &[u8], hash: &[u8]) -> Option<Request> {
                 .unwrap_or_default()
     });
     if !authorized {
-        let res = Response::empty(StatusCode(401)).with_header(
+        trace!("invalid login attempt {rq:?}");
+
+        let res = Response::empty(status::UNAUTHORIZED).with_header(
             Header::from_bytes(
                 b"WWW-Authenticate",
                 b"Basic realm=\"WebDav\", charset=\"UTF-8\"",
@@ -131,6 +134,8 @@ fn authenticate(rq: Request, salt: &[u8], hash: &[u8]) -> Option<Request> {
 
 fn handle(mut rq: Request, dir: &Path) {
     let dav = WebDav::new(dir.into());
+
+    let is_litmus = rq.headers().iter().any(|h| h.field == dav::LITMUS);
 
     let _ = match dav.handle(&mut rq) {
         Ok(res) => rq.respond(res),
@@ -148,7 +153,9 @@ fn handle(mut rq: Request, dir: &Path) {
             Error::Io(e) => rq.respond(Response::empty(match e.kind() {
                 ErrorKind::NotFound => status::NOT_FOUND,
                 ErrorKind::PermissionDenied => status::FORBIDDEN,
-                ErrorKind::AlreadyExists => status::METHOD_NOT_ALLOWED,
+                ErrorKind::AlreadyExists if is_litmus => status::METHOD_NOT_ALLOWED,
+                // Some clients just love recreating already existing directories
+                ErrorKind::AlreadyExists => status::NO_CONTENT,
                 ErrorKind::InvalidInput => status::BAD_REQUEST,
                 ErrorKind::InvalidData => status::BAD_REQUEST,
                 ErrorKind::Unsupported => status::FORBIDDEN,
@@ -157,7 +164,7 @@ fn handle(mut rq: Request, dir: &Path) {
                 _ => {
                     error!("{e:?}");
                     status::INTERNAL_SERVER_ERROR
-                },
+                }
             })),
         },
     };

@@ -4,25 +4,26 @@ version = "0.1.0"
 edition = "2021"
 default-run = "lugia-dav"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [profile.release]
 lto = "thin"
 strip = true
 
 [dependencies]
-base64 = "0.21"
-clap = { version = "4.4", features = ["derive"] }
-dav-server = { version = "0.5", default-features = false, features = ["localfs", "warp-compat"] }
-# dav-server = { path = "../dav-server-rs", default-features = false, features = ["localfs", "warp-compat"] }
-env_logger = { version = "0.10", default-features = false, features = ["humantime", "auto-color"] }
-futures-util = "0.3"
 hex = "0.4"
-log = "0.4"
-rand = { version = "0.8", optional = true }
+base64 = "0.22"
 sha2 = "0.10"
-tokio = { version = "1.35", features = ["fs", "sync", "time", "macros", "rt-multi-thread"] }
-warp = { version = "0.3", default-features = false, features = ["tls"] }
+url = "2.5"
+serde = { version = "1.0", features = ["derive"] }
+quick-xml = { version = "0.36", features = ["serde", "serialize"] }
+clap = { version = "4.4", features = ["derive"] }
+env_logger = { version = "0.11", default-features = false, features = [
+    "humantime",
+    "auto-color",
+] }
+log = "0.4"
+mime_guess = "2.0"
+tiny_http = { version = "0.12", features = ["ssl-rustls"] }
+rand = { version = "0.8", optional = true }
 
 [[bin]]
 name = "login"

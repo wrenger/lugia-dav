@@ -1,5 +1,4 @@
 use std::fs;
-use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -8,8 +7,7 @@ use std::thread::{self, available_parallelism};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use clap::Parser;
-use dav::{Error, WebDav};
-use log::{error, info, trace};
+use log::{info, trace};
 use sha2::{Digest, Sha256};
 use tiny_http::{Header, Request, Response, Server, SslConfig};
 
@@ -95,8 +93,14 @@ fn start(
         for _ in 0..threads {
             let guard = s.spawn(|| {
                 for rq in server.incoming_requests() {
-                    if let Some(rq) = authenticate(rq) {
-                        handle(rq, dir);
+                    if let Some(mut rq) = authenticate(rq) {
+                        let _ = match dav::handle(dir, &mut rq) {
+                            Ok(res) => rq.respond(res),
+                            Err(e) => {
+                                let res = e.response(&rq);
+                                rq.respond(res)
+                            }
+                        };
                     }
                     if !running.load(Ordering::Relaxed) {
                         break;
@@ -130,44 +134,6 @@ fn authenticate(rq: Request, salt: &[u8], hash: &[u8]) -> Option<Request> {
         return None;
     }
     Some(rq)
-}
-
-fn handle(mut rq: Request, dir: &Path) {
-    let dav = WebDav::new(dir.into());
-
-    let is_litmus = rq.headers().iter().any(|h| h.field == dav::LITMUS);
-
-    let _ = match dav.handle(&mut rq) {
-        Ok(res) => rq.respond(res),
-        Err(e) => match e {
-            Error::XML => rq.respond(
-                Response::from_string("XML parsing error").with_status_code(status::BAD_REQUEST),
-            ),
-            Error::NotImplemented => rq.respond(Response::empty(status::NOT_IMPLEMENTED)),
-            Error::Internal => rq.respond(Response::empty(status::INTERNAL_SERVER_ERROR)),
-            Error::Status(s) => rq.respond(Response::empty(s)),
-            Error::Header(h) => rq.respond(
-                Response::from_string(format!("Missing header: {h}"))
-                    .with_status_code(status::BAD_REQUEST),
-            ),
-            Error::Io(e) => rq.respond(Response::empty(match e.kind() {
-                ErrorKind::NotFound => status::NOT_FOUND,
-                ErrorKind::PermissionDenied => status::FORBIDDEN,
-                ErrorKind::AlreadyExists if is_litmus => status::METHOD_NOT_ALLOWED,
-                // Some clients just love recreating already existing directories
-                ErrorKind::AlreadyExists => status::NO_CONTENT,
-                ErrorKind::InvalidInput => status::BAD_REQUEST,
-                ErrorKind::InvalidData => status::BAD_REQUEST,
-                ErrorKind::Unsupported => status::FORBIDDEN,
-                ErrorKind::UnexpectedEof => status::INTERNAL_SERVER_ERROR,
-                ErrorKind::OutOfMemory => status::INTERNAL_SERVER_ERROR,
-                _ => {
-                    error!("{e:?}");
-                    status::INTERNAL_SERVER_ERROR
-                }
-            })),
-        },
-    };
 }
 
 fn valid(salt: &[u8], hash: &[u8], userpass: &str) -> bool {
@@ -275,7 +241,7 @@ mod test {
 
         let running = AtomicBool::new(true);
         thread::scope(|s| {
-            let handle = s.spawn(|| start(&server, |rq| Some(rq), &dir, &running));
+            let handle = s.spawn(|| start(&server, Some, &dir, &running));
 
             let status = Command::new("./litmus")
                 .current_dir(litmus_dir)

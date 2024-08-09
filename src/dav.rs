@@ -1,7 +1,8 @@
 use std::fs::{File, Metadata};
 use std::io::{self, Seek, Write};
 use std::io::{ErrorKind, SeekFrom};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
@@ -109,7 +110,7 @@ pub fn handle(root: &Path, rq: &mut Request) -> Result<ResponseBox, Error> {
             .collect::<Vec<_>>()
     );
 
-    let relpath = path_normalize(rq.url())?;
+    let relpath = parse_path(rq.url()).ok_or(status::BAD_REQUEST)?;
 
     let reader = rq.as_reader();
     let mut body = Vec::new();
@@ -139,12 +140,12 @@ pub fn handle(root: &Path, rq: &mut Request) -> Result<ResponseBox, Error> {
         Method::Get => get(root, &relpath, false),
         Method::Head => get(root, &relpath, true),
         Method::Put => put(root, &relpath, body),
-        Method::Patch => patch(root, relpath, rq.headers(), body),
+        Method::Patch => patch(root, &relpath, rq.headers(), body),
         Method::Options => options(),
         Method::Delete => delete(root, &relpath),
         m => match m.as_str() {
-            "PROPFIND" => propfind(root, relpath, rq.headers(), body),
-            "PROPPATCH" => proppatch(root, relpath, rq.headers(), body),
+            "PROPFIND" => propfind(root, &relpath, rq.headers(), body),
+            "PROPPATCH" => proppatch(root, &relpath, rq.headers(), body),
             "MKCOL" => mkcol(root, &relpath),
             "COPY" => copy(root, &relpath, rq.headers()),
             "MOVE" => move_(root, &relpath, rq.headers()),
@@ -155,32 +156,9 @@ pub fn handle(root: &Path, rq: &mut Request) -> Result<ResponseBox, Error> {
     }
 }
 
-fn path_normalize(uri: &str) -> Result<PathBuf, Error> {
-    let mut components = Path::new(uri).components();
-
-    if Some(Component::RootDir) != components.next() {
-        return Err(status::FORBIDDEN.into());
-    }
-
-    let mut buf = PathBuf::new();
-    for component in components {
-        match component {
-            Component::Prefix(_) | Component::RootDir => return Err(status::FORBIDDEN.into()),
-            Component::CurDir => {} // skip
-            Component::ParentDir => {
-                if !buf.pop() {
-                    return Err(status::FORBIDDEN.into());
-                }
-            }
-            Component::Normal(_) => buf.push(component),
-        }
-    }
-    Ok(buf)
-}
-
 fn get(root: &Path, relpath: &Path, head: bool) -> Result<ResponseBox, Error> {
     let path = root
-        .join(&relpath)
+        .join(relpath)
         .canonicalize()
         .map_err(|_| status::NOT_FOUND)?;
 
@@ -206,22 +184,21 @@ fn get(root: &Path, relpath: &Path, head: bool) -> Result<ResponseBox, Error> {
             } else {
                 "unknown"
             };
-            let str_escaped = entry
-                .path()
-                .strip_prefix(root)
-                .map_err(|_| Error::Internal)?
-                .to_string_lossy()
-                .escape_default()
-                .collect::<String>();
-            let html_escaped = entry
-                .file_name()
-                .to_string_lossy()
-                .replace('<', "&lt;")
-                .replace('>', "&gt;");
+            let file_path = url_encode(
+                &Path::new("/").join(
+                    entry
+                        .path()
+                        .strip_prefix(root)
+                        .map_err(|_| Error::Internal)?,
+                ),
+            );
+            let file_name = entry.file_name();
+            let file_name = quick_xml::escape::escape(file_name.to_str().unwrap_or_default());
             writeln!(
                 out,
-                "<tr><td><a href=\"/{str_escaped}\">{html_escaped}</a></td>\
+                "<tr><td><a href=\"{}\">{file_name}</a></td>\
                 <td>{kind}</td><td>{}</td>",
+                file_path.escape_default(),
                 meta.len()
             )
             .unwrap();
@@ -258,12 +235,14 @@ fn put(root: &Path, relpath: &Path, body: Vec<u8>) -> Result<ResponseBox, Error>
 
 fn patch(
     root: &Path,
-    path: PathBuf,
+    relpath: &Path,
     headers: &[Header],
     body: Vec<u8>,
 ) -> Result<ResponseBox, Error> {
-    let path = path.canonicalize().map_err(|_| status::NOT_FOUND)?;
-    path.strip_prefix(root).map_err(|_| status::FORBIDDEN)?;
+    let path = root
+        .join(relpath)
+        .canonicalize()
+        .map_err(|_| status::NOT_FOUND)?;
 
     let meta = std::fs::metadata(&path)?;
     let offset = if let Some(offset) = headers.iter().find(|h| h.field == UPDATE_RANGE) {
@@ -322,7 +301,7 @@ fn delete(root: &Path, relpath: &Path) -> Result<ResponseBox, Error> {
 
 fn propfind(
     root: &Path,
-    relpath: PathBuf,
+    relpath: &Path,
     headers: &[Header],
     body: Vec<u8>,
 ) -> Result<ResponseBox, Error> {
@@ -378,7 +357,7 @@ fn propfind(
 
 fn proppatch(
     _root: &Path,
-    _path: PathBuf,
+    _path: &Path,
     _headers: &[Header],
     _body: Vec<u8>,
 ) -> Result<ResponseBox, Error> {
@@ -395,16 +374,9 @@ fn mkcol(root: &Path, relpath: &Path) -> Result<ResponseBox, Error> {
     Ok(Response::empty(status::CREATED).boxed())
 }
 
-fn extract_dst(root: &Path, headers: &[Header]) -> Option<PathBuf> {
-    let dst = headers.iter().find(|h| h.field == DESTINATION)?;
-    let uri = Url::parse(dst.value.as_str()).ok()?;
-    let path = path_normalize(uri.path()).ok()?;
-    Some(root.join(path))
-}
-
 fn copy(root: &Path, relpath: &Path, headers: &[Header]) -> Result<ResponseBox, Error> {
     let path = root.join(relpath);
-    let mut dst = extract_dst(root, headers).ok_or(status::FORBIDDEN)?;
+    let mut dst = header_destination(root, headers).ok_or(status::FORBIDDEN)?;
 
     let overwrite = headers
         .iter()
@@ -455,7 +427,7 @@ fn copy(root: &Path, relpath: &Path, headers: &[Header]) -> Result<ResponseBox, 
 
 fn move_(root: &Path, relpath: &Path, headers: &[Header]) -> Result<ResponseBox, Error> {
     let path = root.join(relpath);
-    let mut dst = extract_dst(root, headers).ok_or(Error::Header(DESTINATION.0))?;
+    let mut dst = header_destination(root, headers).ok_or(Error::Header(DESTINATION.0))?;
 
     let overwrite = headers
         .iter()
@@ -641,40 +613,78 @@ struct PropCollection {
 
 impl PropResponse {
     fn new(path: &Path, meta: &Metadata, base: &Path) -> Result<Self, Error> {
+        let display = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .into();
+
         Ok(Self {
-            href: format!(
-                "/{}",
-                path.strip_prefix(base)
-                    .map_err(|_| status::NOT_FOUND)?
-                    .display()
+            href: url_encode(
+                &Path::new("/").join(path.strip_prefix(base).map_err(|_| status::NOT_FOUND)?),
             ),
             propstat: PropStat {
                 prop: Prop {
-                    prop: vec![
-                        PropKind::CreationDate(date_str(meta.created()?)),
-                        PropKind::DisplayName(
-                            path.file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or_default()
-                                .into(),
-                        ),
-                        PropKind::GetContentLength(meta.len()),
-                        PropKind::GetContentType(
-                            mime_guess::from_path(path)
-                                .first_or_text_plain()
-                                .as_ref()
-                                .into(),
-                        ),
-                        PropKind::ResourceType(
-                            meta.is_dir().then_some(PropCollection { collection: () }),
-                        ),
-                        PropKind::GetLastModified(date_str(meta.modified()?)),
-                    ],
+                    prop: if meta.is_dir() {
+                        vec![
+                            PropKind::CreationDate(date_str(meta.created()?)),
+                            PropKind::DisplayName(display),
+                            PropKind::ResourceType(Some(PropCollection { collection: () })),
+                            PropKind::GetLastModified(date_str(meta.modified()?)),
+                        ]
+                    } else {
+                        let mime = mime_guess::from_path(path)
+                            .first_or_text_plain()
+                            .as_ref()
+                            .into();
+                        vec![
+                            PropKind::CreationDate(date_str(meta.created()?)),
+                            PropKind::DisplayName(display),
+                            PropKind::GetContentLength(meta.len()),
+                            PropKind::GetContentType(mime),
+                            PropKind::ResourceType(None),
+                            PropKind::GetLastModified(date_str(meta.modified()?)),
+                        ]
+                    },
                 },
                 status: status::OK,
             },
         })
     }
+}
+
+fn url_encode(p: &Path) -> String {
+    Url::from_file_path(p)
+        .map(|u| u.path().to_string())
+        .unwrap_or_default()
+}
+
+fn header_destination(root: &Path, headers: &[Header]) -> Option<PathBuf> {
+    let dst = headers.iter().find(|h| h.field == DESTINATION)?;
+    let uri = Url::parse(dst.value.as_str()).ok()?;
+    let path = parse_url_path(&uri)?;
+    Some(root.join(path))
+}
+
+fn parse_path(p: &str) -> Option<PathBuf> {
+    static BASE: LazyLock<Url> = LazyLock::new(|| Url::parse("https://localhost").unwrap());
+
+    let url = Url::options().base_url(Some(&BASE)).parse(p).ok()?;
+    parse_url_path(&url)
+}
+
+fn parse_url_path(url: &Url) -> Option<PathBuf> {
+    if url.fragment().is_some()
+        || url.query().is_some()
+        || url.password().is_some()
+        || !url.username().is_empty()
+    {
+        error!("path {url}");
+        return None;
+    }
+    let abspath = url.to_file_path().ok()?;
+    let relpath = abspath.strip_prefix("/").ok()?;
+    Some(relpath.into())
 }
 
 fn date_str(time: SystemTime) -> String {
@@ -684,7 +694,7 @@ fn date_str(time: SystemTime) -> String {
 #[cfg(test)]
 mod test {
     use super::{byte_range, PropResponse};
-    use crate::dav::{date_str, PropFind};
+    use crate::dav::{date_str, url_encode, PropFind};
     use std::path::Path;
 
     #[test]
@@ -734,13 +744,24 @@ mod test {
                 "<PropResponse><href>/src</href><propstat><prop>\
                 <creationdate>{ctime}</creationdate>\
                 <displayname>src</displayname>\
-                <getcontentlength>{}</getcontentlength>\
-                <getcontenttype>text/plain</getcontenttype>\
                 <resourcetype><collection/></resourcetype>\
                 <getlastmodified>{mtime}</getlastmodified>\
                 </prop><status>HTTP/1.1 200 OK</status></propstat></PropResponse>",
-                meta.len(),
             )
         );
+    }
+
+    #[test]
+    fn url_path() {
+        let url = url_encode(Path::new("/foo/bar/baz/<>??"));
+        println!("{url}");
+
+        let url = url_encode(Path::new("/foo/bar/../"));
+        println!("{url}");
+
+        let url = url_encode(Path::new("/foo/../data.bin"));
+        println!("{url}");
+
+        assert!(url_encode(Path::new("http://localhost/foo/../baz/tmp/")).is_empty());
     }
 }

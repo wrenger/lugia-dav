@@ -12,6 +12,8 @@ use sha2::{Digest, Sha256};
 use tiny_http::{Header, Request, Response, Server, SslConfig};
 
 mod dav;
+mod multi_status;
+mod util;
 
 mod status {
     use tiny_http::StatusCode;

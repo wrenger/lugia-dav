@@ -1,18 +1,17 @@
-use std::fs::{File, Metadata};
+use std::fs::File;
 use std::io::{self, Seek, Write};
 use std::io::{ErrorKind, SeekFrom};
-use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
-use std::time::SystemTime;
+use std::path::Path;
 
-use chrono::{DateTime, Utc};
-use log::{error, info, warn};
-use serde::{Deserialize, Serialize, Serializer};
+use log::{debug, error, info, warn};
+use maud::{html, Markup};
+use serde::{Deserialize, Serialize};
 use std::fs::DirEntry;
 use tiny_http::{Header, HeaderField, Method, Request, Response, ResponseBox, StatusCode};
-use url::Url;
 
+use crate::multi_status::{MultiStatus, PropResponse};
 use crate::status;
+use crate::util::{byte_range, header_destination, parse_path, url_encode};
 
 const MAX_FILE_SIZE: usize = 1 << 30; // 1GiB
 
@@ -38,17 +37,15 @@ impl Error {
         let is_litmus = rq.headers().iter().any(|h| h.field == LITMUS);
 
         match self {
-            Error::Xml => Response::from_string("XML parsing error")
+            Error::Xml => Response::from_string("XML serde error")
                 .with_status_code(status::BAD_REQUEST)
                 .boxed(),
-
             Error::NotImplemented => Response::empty(status::NOT_IMPLEMENTED).boxed(),
             Error::Internal => Response::empty(status::INTERNAL_SERVER_ERROR).boxed(),
             Error::Status(s) => Response::empty(s).boxed(),
             Error::Header(h) => Response::from_string(format!("Missing header: {h}"))
                 .with_status_code(status::BAD_REQUEST)
                 .boxed(),
-
             Error::Io(e) => Response::empty(match e.kind() {
                 ErrorKind::NotFound => status::NOT_FOUND,
                 ErrorKind::PermissionDenied => status::FORBIDDEN,
@@ -80,6 +77,12 @@ impl From<quick_xml::DeError> for Error {
         Self::Xml
     }
 }
+impl From<quick_xml::SeError> for Error {
+    fn from(e: quick_xml::SeError) -> Self {
+        error!("Serialize: {e:?}");
+        Self::Xml
+    }
+}
 impl From<StatusCode> for Error {
     fn from(s: StatusCode) -> Self {
         Self::Status(s)
@@ -100,7 +103,7 @@ impl PartialEq<HeaderValue> for HeaderField {
 }
 
 pub fn handle(root: &Path, rq: &mut Request) -> Result<ResponseBox, Error> {
-    info!(
+    debug!(
         "{} {} {:?}",
         rq.method(),
         rq.url(),
@@ -163,64 +166,87 @@ fn get(root: &Path, relpath: &Path, head: bool) -> Result<ResponseBox, Error> {
         .map_err(|_| status::NOT_FOUND)?;
 
     if path.is_dir() {
-        use std::fmt::Write;
-
-        let mut out = format!(
-            "<!DOCTYPE html><head><title>/{}</title></head>\
-            <body><table><tr><th>Name</th><th>Type</th><th>Size</th><tr>",
-            relpath.display()
-        );
-
-        let mut dir = std::fs::read_dir(path)?;
-        while let Some(entry) = dir.next().transpose()? {
-            let meta = entry.metadata()?;
-            let file_type = entry.file_type()?;
-            let kind = if file_type.is_file() {
-                "file"
-            } else if file_type.is_dir() {
-                "dir"
-            } else if file_type.is_symlink() {
-                "symlink"
-            } else {
-                "unknown"
-            };
-            let file_path = url_encode(
-                &Path::new("/").join(
-                    entry
-                        .path()
-                        .strip_prefix(root)
-                        .map_err(|_| Error::Internal)?,
-                ),
-            );
-            let file_name = entry.file_name();
-            let file_name = quick_xml::escape::escape(file_name.to_str().unwrap_or_default());
-            writeln!(
-                out,
-                "<tr><td><a href=\"{}\">{file_name}</a></td>\
-                <td>{kind}</td><td>{}</td>",
-                file_path.escape_default(),
-                meta.len()
-            )
-            .unwrap();
+        let str_path = relpath.to_string_lossy();
+        fn page(title: &str, body: Markup) -> Markup {
+            html! {
+                (maud::DOCTYPE);
+                html {
+                    head {
+                        meta charset="utf-8";
+                        title { (title) }
+                        meta viewport="width=device-width, initial-scale=1";
+                        style { ("@media(prefers-color-scheme: dark) { body { background-color: black; } }") }
+                        link rel="stylesheet" href="https://cdn.simplecss.org/simple.min.css";
+                    }
+                    body { (body) }
+                }
+            }
         }
-        writeln!(out, "</body>").unwrap();
+        let out = page(
+            &str_path,
+            html! {
+                h1 { ("/") (str_path) }
+                table width="100%" {
+                    tr {
+                        th width="100%" { "Name" }
+                        th { "Type" }
+                        th { "Size" }
+                    }
+                    @if let Some(parent) = relpath.parent() {
+                        @let file_path = url_encode(&Path::new("/").join(parent));
+                        tr {
+                            td width="100%" { a href=(file_path) { ".." } }
+                            td { "dir" }
+                            td { "" }
+                        }
+                    }
+                    @for entry in std::fs::read_dir(path.clone())? {
+                        @let entry = entry?;
+                        @let meta = entry.metadata()?;
+                        @let file_type = entry.file_type()?;
+                        @let kind = if file_type.is_file() {
+                            "file"
+                        } else if file_type.is_dir() {
+                            "dir"
+                        } else if file_type.is_symlink() {
+                            "symlink"
+                        } else {
+                            "unknown"
+                        };
+                        @let file_path = url_encode(
+                            &Path::new("/").join(
+                                entry
+                                    .path()
+                                    .strip_prefix(root)
+                                    .map_err(|_| Error::Internal)?,
+                            ),
+                        );
+                        @let file_name = entry.file_name();
+                        tr {
+                            td width="100%" { a href=(file_path) { (file_name.to_string_lossy()) } }
+                            td { (kind) }
+                            td { (meta.len()) }
+                        }
+                    }
+                }
+            },
+        );
         Ok(Response::from_string(out)
             .with_header(Header::from_bytes(CONTENT_TYPE.0, b"text/html; charset=utf-8").unwrap())
             .boxed())
     } else if path.is_file() {
-        let mut res = if head {
+        let res = if head {
             Response::empty(status::OK).boxed()
         } else {
             Response::from_file(File::open(&path)?).boxed()
         };
-        res.add_header(
+        Ok(res.with_header(
             Header::from_bytes(
                 CONTENT_TYPE.0,
                 mime_guess::from_path(&path).first_or_text_plain().as_ref(),
             )
             .unwrap(),
-        );
-        Ok(res)
+        ))
     } else {
         Err(status::NOT_FOUND.into())
     }
@@ -343,7 +369,7 @@ fn propfind(
         // We currently don't support symlinks
         return Err(status::NOT_FOUND.into());
     }
-    info!("{out:?}");
+    debug!("{out:?}");
 
     let out = format!(
         "<?xml version=\"1.0\" encoding=\"utf-8\" ?>{}",
@@ -505,23 +531,6 @@ fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> io::Result<()> 
     Ok(())
 }
 
-fn byte_range(range: &str, len: u64) -> Option<(u64, u64)> {
-    let (start, end) = range.strip_prefix("bytes=")?.split_once('-')?;
-    if start.is_empty() {
-        let end: u64 = end.parse().ok()?;
-        let start = len.checked_sub(end)?;
-        Some((start, len - 1))
-    } else {
-        let start = start.parse().ok()?;
-        let end = if end.is_empty() {
-            len - 1
-        } else {
-            end.parse().ok()?
-        };
-        (start <= end && end < len).then_some((start, end))
-    }
-}
-
 #[derive(Deserialize, Serialize, Debug, Default)]
 #[serde(rename = "propfind")]
 struct PropFind {
@@ -551,163 +560,9 @@ enum PropFindKind {
     Other,
 }
 
-#[derive(Serialize, Debug)]
-#[serde(rename = "multistatus")]
-struct MultiStatus {
-    #[serde(rename = "@xmlns", serialize_with = "MultiStatus::dav_ns")]
-    xmlns: (),
-    response: Vec<PropResponse>,
-}
-impl MultiStatus {
-    fn new() -> Self {
-        Self {
-            xmlns: (),
-            response: Vec::new(),
-        }
-    }
-    fn dav_ns<S: Serializer>(_: &(), se: S) -> Result<S::Ok, S::Error> {
-        se.serialize_str("DAV:")
-    }
-}
-
-#[derive(Serialize, Debug)]
-struct PropResponse {
-    href: String,
-    propstat: PropStat,
-}
-
-#[derive(Serialize, Debug)]
-struct PropStat {
-    prop: Prop,
-    #[serde(serialize_with = "PropStat::status_code")]
-    status: StatusCode,
-}
-impl PropStat {
-    fn status_code<S: Serializer>(s: &StatusCode, se: S) -> Result<S::Ok, S::Error> {
-        se.serialize_str(&format!("HTTP/1.1 {} {}", s.0, s.default_reason_phrase()))
-    }
-}
-
-#[derive(Serialize, Debug)]
-#[serde(rename = "prop")]
-struct Prop {
-    #[serde(rename = "$value")]
-    prop: Vec<PropKind>,
-}
-
-#[derive(Serialize, Debug)]
-#[serde(rename_all = "lowercase")]
-enum PropKind {
-    CreationDate(String),
-    DisplayName(String),
-    GetContentLength(u64),
-    GetContentType(String),
-    GetLastModified(String),
-    ResourceType(Option<PropCollection>),
-}
-
-#[derive(Serialize, Debug)]
-struct PropCollection {
-    collection: (),
-}
-
-impl PropResponse {
-    fn new(path: &Path, meta: &Metadata, base: &Path) -> Result<Self, Error> {
-        let display = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default()
-            .into();
-
-        Ok(Self {
-            href: url_encode(
-                &Path::new("/").join(path.strip_prefix(base).map_err(|_| status::NOT_FOUND)?),
-            ),
-            propstat: PropStat {
-                prop: Prop {
-                    prop: if meta.is_dir() {
-                        vec![
-                            PropKind::CreationDate(date_str(meta.created()?)),
-                            PropKind::DisplayName(display),
-                            PropKind::ResourceType(Some(PropCollection { collection: () })),
-                            PropKind::GetLastModified(date_str(meta.modified()?)),
-                        ]
-                    } else {
-                        let mime = mime_guess::from_path(path)
-                            .first_or_text_plain()
-                            .as_ref()
-                            .into();
-                        vec![
-                            PropKind::CreationDate(date_str(meta.created()?)),
-                            PropKind::DisplayName(display),
-                            PropKind::GetContentLength(meta.len()),
-                            PropKind::GetContentType(mime),
-                            PropKind::ResourceType(None),
-                            PropKind::GetLastModified(date_str(meta.modified()?)),
-                        ]
-                    },
-                },
-                status: status::OK,
-            },
-        })
-    }
-}
-
-fn url_encode(p: &Path) -> String {
-    Url::from_file_path(p)
-        .map(|u| u.path().to_string())
-        .unwrap_or_default()
-}
-
-fn header_destination(root: &Path, headers: &[Header]) -> Option<PathBuf> {
-    let dst = headers.iter().find(|h| h.field == DESTINATION)?;
-    let uri = Url::parse(dst.value.as_str()).ok()?;
-    let path = parse_url_path(&uri)?;
-    Some(root.join(path))
-}
-
-fn parse_path(p: &str) -> Option<PathBuf> {
-    static BASE: LazyLock<Url> = LazyLock::new(|| Url::parse("https://localhost").unwrap());
-
-    let url = Url::options().base_url(Some(&BASE)).parse(p).ok()?;
-    parse_url_path(&url)
-}
-
-fn parse_url_path(url: &Url) -> Option<PathBuf> {
-    if url.fragment().is_some()
-        || url.query().is_some()
-        || url.password().is_some()
-        || !url.username().is_empty()
-    {
-        error!("path {url}");
-        return None;
-    }
-    let abspath = url.to_file_path().ok()?;
-    let relpath = abspath.strip_prefix("/").ok()?;
-    Some(relpath.into())
-}
-
-fn date_str(time: SystemTime) -> String {
-    DateTime::<Utc>::from(time).to_rfc3339()
-}
-
 #[cfg(test)]
 mod test {
-    use super::{byte_range, PropResponse};
-    use crate::dav::{date_str, url_encode, PropFind};
-    use std::path::Path;
-
-    #[test]
-    fn parse_range() {
-        assert_eq!(byte_range("bytes=0-499", 500), Some((0, 499)));
-        assert_eq!(byte_range("bytes=0-", 500), Some((0, 499)));
-        assert_eq!(byte_range("bytes=299-", 500), Some((299, 499)));
-        assert_eq!(byte_range("bytes=-500", 500), Some((0, 499)));
-        assert_eq!(byte_range("bytes=-300", 500), Some((200, 499)));
-        assert_eq!(byte_range("bytes=500-", 500), None);
-        assert_eq!(byte_range("bytes=-501", 500), None);
-        assert_eq!(byte_range("bytes=0-500", 500), None);
-    }
+    use crate::dav::PropFind;
 
     #[test]
     fn propfind() {
@@ -723,45 +578,5 @@ mod test {
 
         let propfind: PropFind = quick_xml::de::from_str(xml).unwrap();
         println!("{propfind:?}");
-    }
-
-    #[test]
-    fn prop_response() {
-        let path = Path::new("src/");
-        let base = Path::new("");
-        let meta = path.metadata().unwrap();
-        let res = PropResponse::new(path, &meta, base).unwrap();
-        let xml = quick_xml::se::to_string(&res).unwrap();
-        println!("{res:?}");
-        println!("{xml}");
-
-        let mtime = date_str(meta.modified().unwrap());
-        let ctime = date_str(meta.created().unwrap());
-
-        assert_eq!(
-            xml,
-            format!(
-                "<PropResponse><href>/src</href><propstat><prop>\
-                <creationdate>{ctime}</creationdate>\
-                <displayname>src</displayname>\
-                <resourcetype><collection/></resourcetype>\
-                <getlastmodified>{mtime}</getlastmodified>\
-                </prop><status>HTTP/1.1 200 OK</status></propstat></PropResponse>",
-            )
-        );
-    }
-
-    #[test]
-    fn url_path() {
-        let url = url_encode(Path::new("/foo/bar/baz/<>??"));
-        println!("{url}");
-
-        let url = url_encode(Path::new("/foo/bar/../"));
-        println!("{url}");
-
-        let url = url_encode(Path::new("/foo/../data.bin"));
-        println!("{url}");
-
-        assert!(url_encode(Path::new("http://localhost/foo/../baz/tmp/")).is_empty());
     }
 }

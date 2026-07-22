@@ -11,7 +11,7 @@ use tiny_http::{Header, HeaderField, Method, Request, Response, ResponseBox, Sta
 
 use crate::multi_status::{MultiStatus, PropResponse};
 use crate::status;
-use crate::util::{byte_range, header_destination, parse_path, url_encode};
+use crate::util::{byte_range, header_destination, parse_path, safe_join, url_encode};
 
 const MAX_FILE_SIZE: usize = 1 << 30; // 1GiB
 
@@ -160,10 +160,7 @@ pub fn handle(root: &Path, rq: &mut Request) -> Result<ResponseBox, Error> {
 }
 
 fn get(root: &Path, relpath: &Path, head: bool) -> Result<ResponseBox, Error> {
-    let path = root
-        .join(relpath)
-        .canonicalize()
-        .map_err(|_| status::NOT_FOUND)?;
+    let path = safe_join(root, relpath).ok_or(status::NOT_FOUND)?;
 
     if path.is_dir() {
         let str_path = relpath.to_string_lossy();
@@ -202,7 +199,7 @@ fn get(root: &Path, relpath: &Path, head: bool) -> Result<ResponseBox, Error> {
                     }
                     @for entry in std::fs::read_dir(path.clone())? {
                         @let entry = entry?;
-                        @let meta = entry.metadata()?;
+                        @let meta = entry.path().symlink_metadata()?;
                         @let file_type = entry.file_type()?;
                         @let kind = if file_type.is_file() {
                             "file"
@@ -253,7 +250,11 @@ fn get(root: &Path, relpath: &Path, head: bool) -> Result<ResponseBox, Error> {
 }
 
 fn put(root: &Path, relpath: &Path, body: Vec<u8>) -> Result<ResponseBox, Error> {
-    let path = root.join(relpath);
+    let path = safe_join(root, relpath).ok_or(status::FORBIDDEN)?;
+    if path.is_dir() {
+        return Err(status::METHOD_NOT_ALLOWED.into());
+    }
+    let existed = path.exists();
     if let Some(p) = path.parent() {
         if !p.exists() {
             // PUT with missing intermediate -> 409
@@ -262,7 +263,12 @@ fn put(root: &Path, relpath: &Path, body: Vec<u8>) -> Result<ResponseBox, Error>
     }
     let mut file = std::fs::File::create(&path)?;
     file.write_all(&body)?;
-    Ok(Response::empty(status::CREATED).boxed())
+    Ok(Response::empty(if existed {
+        status::NO_CONTENT
+    } else {
+        status::CREATED
+    })
+    .boxed())
 }
 
 fn patch(
@@ -271,10 +277,7 @@ fn patch(
     headers: &[Header],
     body: Vec<u8>,
 ) -> Result<ResponseBox, Error> {
-    let path = root
-        .join(relpath)
-        .canonicalize()
-        .map_err(|_| status::NOT_FOUND)?;
+    let path = safe_join(root, relpath).ok_or(status::NOT_FOUND)?;
 
     let meta = std::fs::metadata(&path)?;
     let offset = if let Some(offset) = headers.iter().find(|h| h.field == UPDATE_RANGE) {
@@ -284,7 +287,9 @@ fn patch(
         } else {
             let (start, end) =
                 byte_range(value, meta.len()).ok_or(Error::Header(UPDATE_RANGE.0))?;
-            assert!(end + 1 - start == body.len() as u64);
+            if (end + 1).checked_sub(start) != Some(body.len() as u64) {
+                return Err(Error::Header(UPDATE_RANGE.0));
+            }
             Some(start)
         }
     } else {
@@ -319,7 +324,7 @@ fn options() -> Result<ResponseBox, Error> {
 }
 
 fn delete(root: &Path, relpath: &Path) -> Result<ResponseBox, Error> {
-    let path = root.join(relpath);
+    let path = safe_join(root, relpath).ok_or(status::FORBIDDEN)?;
     let meta = std::fs::metadata(&path)?;
     if meta.is_file() {
         std::fs::remove_file(&path)?;
@@ -337,40 +342,53 @@ fn propfind(
     headers: &[Header],
     body: Vec<u8>,
 ) -> Result<ResponseBox, Error> {
-    let path = root.join(relpath);
+    let path = safe_join(root, relpath).ok_or(status::FORBIDDEN)?;
 
-    let _propfind = if !body.is_empty() {
+    let propfind = if !body.is_empty() {
         let body = String::from_utf8(body).map_err(|_| Error::Xml)?;
         info!("{body}");
         quick_xml::de::from_str(&body)?
     } else {
         PropFind::default()
     };
+    let names_only = matches!(&propfind.propfind, PropFindInner::PropName);
+    let requested_names = match &propfind.propfind {
+        PropFindInner::Prop { props } => Some(
+            props
+                .iter()
+                .filter_map(PropFindKind::name)
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+        ),
+        PropFindInner::AllProp | PropFindInner::PropName => None,
+    };
 
     let mut out = MultiStatus::new();
     let meta = std::fs::metadata(&path)?;
     if meta.is_dir() {
-        let depth: usize = if let Some(depth) = headers.iter().find(|h| h.field == DEPTH) {
-            depth
-                .value
-                .as_str()
-                .parse()
-                .map_err(|_| Error::Header(DEPTH.0))?
-        } else {
-            1
-        };
+        let depth = headers
+            .iter()
+            .find(|header| header.field == DEPTH)
+            .map(|header| parse_depth(header.value.as_str()))
+            .transpose()?
+            .unwrap_or(usize::MAX);
 
-        if depth == 0 {
-            out.response.push(PropResponse::new(&path, &meta, root)?)
-        } else {
+        let mut response = PropResponse::new(&path, &meta, root)?;
+        response.filter(requested_names.as_deref(), names_only);
+        out.response.push(response);
+
+        if depth > 0 {
             let mut stream = read_dir_rec(&path, depth)?;
             while let Some(entry) = stream.pop() {
-                out.response
-                    .push(PropResponse::new(&entry.path(), &entry.metadata()?, root)?);
+                let mut response = PropResponse::new(&entry.path(), &entry.metadata()?, root)?;
+                response.filter(requested_names.as_deref(), names_only);
+                out.response.push(response);
             }
         }
     } else if meta.is_file() {
-        out.response.push(PropResponse::new(&path, &meta, root)?);
+        let mut response = PropResponse::new(&path, &meta, root)?;
+        response.filter(requested_names.as_deref(), names_only);
+        out.response.push(response);
     } else {
         // We currently don't support symlinks
         return Err(status::NOT_FOUND.into());
@@ -397,7 +415,10 @@ fn proppatch(
 }
 
 fn mkcol(root: &Path, relpath: &Path) -> Result<ResponseBox, Error> {
-    let path = root.join(relpath);
+    let path = safe_join(root, relpath).ok_or(status::FORBIDDEN)?;
+    if path.exists() {
+        return Err(status::METHOD_NOT_ALLOWED.into());
+    }
     if !path.parent().ok_or(status::FORBIDDEN)?.exists() {
         return Err(status::CONFLICT.into());
     }
@@ -407,27 +428,35 @@ fn mkcol(root: &Path, relpath: &Path) -> Result<ResponseBox, Error> {
 }
 
 fn copy(root: &Path, relpath: &Path, headers: &[Header]) -> Result<ResponseBox, Error> {
-    let path = root.join(relpath);
+    let path = safe_join(root, relpath).ok_or(status::FORBIDDEN)?;
+    let source_meta = std::fs::metadata(&path)?;
+    let source_is_dir = source_meta.is_dir();
+    let depth = headers
+        .iter()
+        .find(|header| header.field == DEPTH)
+        .map(|header| parse_copy_depth(header.value.as_str()))
+        .transpose()?
+        .unwrap_or(usize::MAX);
     let mut dst = header_destination(root, headers).ok_or(status::FORBIDDEN)?;
 
-    let overwrite = headers
-        .iter()
-        .find(|h| h.field == OVERWRITE)
-        .is_some_and(|v| {
-            let v = v.value.as_str();
-            v.eq_ignore_ascii_case("t") || v == "1"
-        });
+    let overwrite = parse_overwrite(headers)?;
+    let destination_collection = !source_is_dir && dst.is_dir();
 
-    // Copy into directory
-    if !path.is_dir() && dst.is_dir() {
-        dst.push(path.file_name().unwrap());
+    // Copy a non-collection into a destination collection.
+    if destination_collection {
+        dst.push(path.file_name().ok_or(status::FORBIDDEN)?);
     }
     if !dst.parent().ok_or(status::FORBIDDEN)?.exists() {
         return Err(status::CONFLICT.into());
     }
+    if dst == path || (source_is_dir && dst.starts_with(&path)) {
+        return Err(status::FORBIDDEN.into());
+    }
 
+    // A depth-zero collection copy creates only the collection itself.
     // Remove overwritten files
-    if dst.exists() {
+    let destination_existed = dst.exists();
+    if destination_existed {
         if !overwrite {
             return Err(Error::Status(status::PRECONDITION_FAILED));
         } else {
@@ -440,8 +469,11 @@ fn copy(root: &Path, relpath: &Path, headers: &[Header]) -> Result<ResponseBox, 
         }
     }
 
-    if std::fs::metadata(&path)?.is_dir() {
-        copy_dir_all(&path, &dst)?;
+    if source_is_dir {
+        std::fs::create_dir(&dst)?;
+        if depth > 0 {
+            copy_dir_contents(&path, &dst)?;
+        }
     } else {
         let e = std::fs::copy(&path, &dst);
         if let Err(e) = e {
@@ -450,7 +482,7 @@ fn copy(root: &Path, relpath: &Path, headers: &[Header]) -> Result<ResponseBox, 
         }
     }
 
-    if overwrite {
+    if destination_existed || (destination_collection && overwrite) {
         Ok(Response::empty(status::NO_CONTENT).boxed())
     } else {
         Ok(Response::empty(status::CREATED).boxed())
@@ -458,27 +490,28 @@ fn copy(root: &Path, relpath: &Path, headers: &[Header]) -> Result<ResponseBox, 
 }
 
 fn move_(root: &Path, relpath: &Path, headers: &[Header]) -> Result<ResponseBox, Error> {
-    let path = root.join(relpath);
+    let path = safe_join(root, relpath).ok_or(status::FORBIDDEN)?;
+    let source_meta = std::fs::metadata(&path)?;
+    let source_is_dir = source_meta.is_dir();
     let mut dst = header_destination(root, headers).ok_or(Error::Header(DESTINATION.0))?;
 
-    let overwrite = headers
-        .iter()
-        .find(|h| h.field == OVERWRITE)
-        .is_some_and(|v| {
-            let v = v.value.as_str();
-            v.eq_ignore_ascii_case("t") || v == "1"
-        });
+    let overwrite = parse_overwrite(headers)?;
+    let destination_collection = !source_is_dir && dst.is_dir();
 
-    // Move into directory
-    if !path.is_dir() && dst.is_dir() {
-        dst.push(path.file_name().unwrap());
+    // Move a non-collection into a destination collection.
+    if destination_collection {
+        dst.push(path.file_name().ok_or(status::FORBIDDEN)?);
     }
     if !dst.parent().ok_or(status::FORBIDDEN)?.exists() {
         return Err(status::CONFLICT.into());
     }
+    if dst == path || (source_is_dir && dst.starts_with(&path)) {
+        return Err(status::FORBIDDEN.into());
+    }
 
     // Remove overwritten files
-    if dst.exists() {
+    let destination_existed = dst.exists();
+    if destination_existed {
         if !overwrite {
             return Err(Error::Status(status::PRECONDITION_FAILED));
         } else {
@@ -493,10 +526,59 @@ fn move_(root: &Path, relpath: &Path, headers: &[Header]) -> Result<ResponseBox,
 
     std::fs::rename(&path, &dst)?;
 
-    if overwrite {
+    if destination_existed || (destination_collection && overwrite) {
         Ok(Response::empty(status::NO_CONTENT).boxed())
     } else {
         Ok(Response::empty(status::CREATED).boxed())
+    }
+}
+
+fn parse_overwrite(headers: &[Header]) -> Result<bool, Error> {
+    let Some(header) = headers.iter().find(|header| header.field == OVERWRITE) else {
+        return Ok(true);
+    };
+    match header.value.as_str() {
+        "1" | "t" | "T" => Ok(true),
+        "0" | "f" | "F" => Ok(false),
+        _ => Err(Error::Header(OVERWRITE.0)),
+    }
+}
+
+fn parse_copy_depth(value: &str) -> Result<usize, Error> {
+    match value {
+        "0" => Ok(0),
+        "infinity" => Ok(usize::MAX),
+        _ => Err(Error::Header(DEPTH.0)),
+    }
+}
+
+fn copy_dir_contents(src: &Path, dst: &Path) -> io::Result<()> {
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let target = dst.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                "symlinks are not supported",
+            ));
+        }
+        if file_type.is_dir() {
+            std::fs::create_dir(&target)?;
+            copy_dir_contents(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
+fn parse_depth(value: &str) -> Result<usize, Error> {
+    match value {
+        "0" => Ok(0),
+        "1" => Ok(1),
+        "infinity" => Ok(usize::MAX),
+        _ => Err(Error::Header(DEPTH.0)),
     }
 }
 
@@ -516,25 +598,15 @@ fn read_dir_rec(path: &Path, depth: usize) -> Result<Vec<DirEntry>, io::Error> {
             }
         };
 
-        if depth > dirs.len() && entry.metadata()?.is_dir() {
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if depth > dirs.len() && file_type.is_dir() {
             dirs.push(std::fs::read_dir(entry.path())?);
         }
         res.push(entry);
     }
-}
-
-fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> io::Result<()> {
-    std::fs::create_dir(&dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        if ty.is_dir() {
-            copy_dir_all(entry.path(), dst.as_ref().join(entry.file_name()))?;
-        } else {
-            std::fs::copy(entry.path(), dst.as_ref().join(entry.file_name()))?;
-        }
-    }
-    Ok(())
 }
 
 #[derive(Deserialize, Serialize, Debug, Default)]
@@ -551,6 +623,7 @@ enum PropFindInner {
         #[serde(rename = "$value")]
         props: Vec<PropFindKind>,
     },
+    PropName,
     #[default]
     AllProp,
 }
@@ -558,12 +631,28 @@ enum PropFindInner {
 #[derive(Deserialize, Serialize, Debug)]
 #[serde(rename_all = "lowercase")]
 enum PropFindKind {
+    CreationDate,
     DisplayName,
-    RessourceType,
+    ResourceType,
     GetContentLength,
+    GetContentType,
     GetLastModified,
     #[serde(other, skip_serializing)]
     Other,
+}
+
+impl PropFindKind {
+    fn name(&self) -> Option<&'static str> {
+        match self {
+            Self::CreationDate => Some("creationdate"),
+            Self::DisplayName => Some("displayname"),
+            Self::ResourceType => Some("resourcetype"),
+            Self::GetContentLength => Some("getcontentlength"),
+            Self::GetContentType => Some("getcontenttype"),
+            Self::GetLastModified => Some("getlastmodified"),
+            Self::Other => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -584,5 +673,19 @@ mod test {
 
         let propfind: PropFind = quick_xml::de::from_str(xml).unwrap();
         println!("{propfind:?}");
+    }
+
+    #[test]
+    fn depth_values() {
+        assert_eq!(super::parse_depth("0").unwrap(), 0);
+        assert_eq!(super::parse_depth("1").unwrap(), 1);
+        assert_eq!(super::parse_depth("infinity").unwrap(), usize::MAX);
+        assert!(super::parse_depth("2").is_err());
+        assert!(super::parse_depth("Infinity").is_err());
+
+        assert_eq!(super::parse_copy_depth("0").unwrap(), 0);
+        assert_eq!(super::parse_copy_depth("infinity").unwrap(), usize::MAX);
+        assert!(super::parse_copy_depth("1").is_err());
+        assert!(super::parse_copy_depth("Infinity").is_err());
     }
 }

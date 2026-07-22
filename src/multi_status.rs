@@ -6,7 +6,7 @@ use tiny_http::StatusCode;
 use crate::{
     dav::Error,
     status,
-    util::{date_str, url_encode},
+    util::{date_str, http_date_str, url_encode},
 };
 
 #[derive(Serialize, Debug)]
@@ -29,12 +29,14 @@ impl MultiStatus {
 }
 
 #[derive(Serialize, Debug)]
+#[serde(rename = "response")]
 pub struct PropResponse {
     href: String,
     propstat: PropStat,
 }
 
 #[derive(Serialize, Debug)]
+#[serde(rename = "propstat")]
 struct PropStat {
     prop: Prop,
     #[serde(serialize_with = "PropStat::status_code")]
@@ -64,6 +66,30 @@ enum PropKind {
     ResourceType(Option<PropCollection>),
 }
 
+impl PropKind {
+    fn clear_value(&mut self) {
+        match self {
+            Self::CreationDate(value)
+            | Self::DisplayName(value)
+            | Self::GetContentType(value)
+            | Self::GetLastModified(value) => value.clear(),
+            Self::GetContentLength(value) => *value = 0,
+            Self::ResourceType(value) => *value = None,
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Self::CreationDate(_) => "creationdate",
+            Self::DisplayName(_) => "displayname",
+            Self::GetContentLength(_) => "getcontentlength",
+            Self::GetContentType(_) => "getcontenttype",
+            Self::GetLastModified(_) => "getlastmodified",
+            Self::ResourceType(_) => "resourcetype",
+        }
+    }
+}
+
 #[derive(Serialize, Debug)]
 struct PropCollection {
     collection: (),
@@ -88,7 +114,7 @@ impl PropResponse {
                             PropKind::CreationDate(date_str(meta.created()?)),
                             PropKind::DisplayName(display),
                             PropKind::ResourceType(Some(PropCollection { collection: () })),
-                            PropKind::GetLastModified(date_str(meta.modified()?)),
+                            PropKind::GetLastModified(http_date_str(meta.modified()?)),
                         ]
                     } else {
                         let mime = mime_guess::from_path(path)
@@ -101,13 +127,27 @@ impl PropResponse {
                             PropKind::GetContentLength(meta.len()),
                             PropKind::GetContentType(mime),
                             PropKind::ResourceType(None),
-                            PropKind::GetLastModified(date_str(meta.modified()?)),
+                            PropKind::GetLastModified(http_date_str(meta.modified()?)),
                         ]
                     },
                 },
                 status: status::OK,
             },
         })
+    }
+
+    pub fn filter(&mut self, names: Option<&[String]>, names_only: bool) {
+        if let Some(names) = names {
+            self.propstat
+                .prop
+                .prop
+                .retain(|property| names.iter().any(|name| property.name() == name));
+        }
+        if names_only {
+            for property in &mut self.propstat.prop.prop {
+                property.clear_value();
+            }
+        }
     }
 }
 
@@ -116,7 +156,7 @@ mod test {
     use std::path::Path;
 
     use crate::multi_status::PropResponse;
-    use crate::util::date_str;
+    use crate::util::{date_str, http_date_str};
 
     #[test]
     fn prop_response() {
@@ -128,18 +168,18 @@ mod test {
         println!("{res:?}");
         println!("{xml}");
 
-        let mtime = date_str(meta.modified().unwrap());
+        let mtime = http_date_str(meta.modified().unwrap());
         let ctime = date_str(meta.created().unwrap());
 
         assert_eq!(
             xml,
             format!(
-                "<PropResponse><href>/src</href><propstat><prop>\
+                "<response><href>/src</href><propstat><prop>\
                 <creationdate>{ctime}</creationdate>\
                 <displayname>src</displayname>\
                 <resourcetype><collection/></resourcetype>\
                 <getlastmodified>{mtime}</getlastmodified>\
-                </prop><status>HTTP/1.1 200 OK</status></propstat></PropResponse>",
+                </prop><status>HTTP/1.1 200 OK</status></propstat></response>",
             )
         );
     }

@@ -1,6 +1,6 @@
 /.direnv
+/.zed
 /target
-Cargo.lock
 /litmus
 /tmp
 /enpass

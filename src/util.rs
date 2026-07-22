@@ -1,4 +1,5 @@
-use std::path::{Path, PathBuf};
+use std::io::ErrorKind;
+use std::path::{Component, Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::SystemTime;
 
@@ -16,10 +17,36 @@ pub fn url_encode(p: &Path) -> String {
 }
 
 pub fn header_destination(root: &Path, headers: &[Header]) -> Option<PathBuf> {
+    static BASE: LazyLock<Url> = LazyLock::new(|| Url::parse("https://localhost").unwrap());
+
     let dst = headers.iter().find(|h| h.field == DESTINATION)?;
-    let uri = Url::parse(dst.value.as_str()).ok()?;
+    let uri = Url::options()
+        .base_url(Some(&BASE))
+        .parse(dst.value.as_str())
+        .ok()?;
     let path = parse_url_path(&uri)?;
-    Some(root.join(path))
+    safe_join(root, &path)
+}
+
+pub fn safe_join(root: &Path, relpath: &Path) -> Option<PathBuf> {
+    let mut current = root.canonicalize().ok()?;
+    for component in relpath.components() {
+        let name = match component {
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+            Component::CurDir => continue,
+            Component::Normal(name) => name,
+        };
+
+        current.push(name);
+        // Not follow symlinks
+        match current.symlink_metadata() {
+            Ok(metadata) if metadata.file_type().is_symlink() => return None,
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+    }
+    Some(current)
 }
 
 pub fn parse_path(p: &str) -> Option<PathBuf> {
@@ -45,6 +72,12 @@ fn parse_url_path(url: &Url) -> Option<PathBuf> {
 
 pub fn date_str(time: SystemTime) -> String {
     DateTime::<Utc>::from(time).to_rfc3339()
+}
+
+pub fn http_date_str(time: SystemTime) -> String {
+    DateTime::<Utc>::from(time)
+        .format("%a, %d %b %Y %H:%M:%S GMT")
+        .to_string()
 }
 
 pub fn byte_range(range: &str, len: u64) -> Option<(u64, u64)> {

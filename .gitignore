@@ -1,5 +1,6 @@
+/.direnv
 /target
 Cargo.lock
-/litmus-*
+/litmus
 /tmp
 /enpass

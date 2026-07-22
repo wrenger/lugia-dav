@@ -166,12 +166,11 @@ struct AuthError;
 
 #[cfg(test)]
 mod test {
-    use std::env::current_dir;
+    use std::fs::create_dir_all;
     use std::net::Ipv4Addr;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::process::Command;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Mutex;
     use std::thread;
 
     use log::info;
@@ -179,77 +178,26 @@ mod test {
 
     use crate::start;
 
-    /// Prevent parallel installations.
-    static INSTALL_LOCK: Mutex<()> = Mutex::new(());
-
-    /// Download, build, and install litmus if not installed already.
-    fn install_litmus() -> PathBuf {
-        const URL: &str = "http://www.webdav.org/neon/litmus/";
-        const VERSION: &str = "0.13";
-        let name = format!("litmus-{VERSION}");
-        let litmus_dir = current_dir().unwrap().join(name.clone());
-        println!("{litmus_dir:?}");
-
-        let _lock = INSTALL_LOCK.lock();
-        if !litmus_dir.exists() {
-            let archive = format!("{name}.tar.gz");
-            let url = format!("{URL}{archive}");
-
-            let status = Command::new("curl")
-                .arg("-O")
-                .arg(url)
-                .status()
-                .expect("curl");
-            assert!(status.success());
-
-            let status = Command::new("tar")
-                .arg("xf")
-                .arg(archive.clone())
-                .status()
-                .expect("tar");
-            assert!(status.success());
-            let archive = current_dir().unwrap().join(archive);
-            std::fs::remove_file(archive).unwrap();
-
-            assert!(litmus_dir.exists());
-            let status = Command::new("./configure")
-                .current_dir(&litmus_dir)
-                .status()
-                .expect("configure");
-            assert!(status.success());
-
-            let status = Command::new("make")
-                .current_dir(&litmus_dir)
-                .status()
-                .expect("make");
-            assert!(status.success());
-        }
-
-        litmus_dir
-    }
-
     #[test]
     fn litmus() {
         let _ = env_logger::builder().is_test(true).try_init();
         info!("start");
 
-        let litmus_dir = install_litmus();
-
         let dir = Path::new("tmp");
-        std::fs::create_dir_all(dir).unwrap();
-        let dir = dir.canonicalize().unwrap();
+        create_dir_all(dir).unwrap();
+
+        let litmus_dir = Path::new("litmus");
+        create_dir_all(litmus_dir).unwrap();
 
         let server = Server::http((Ipv4Addr::new(127, 0, 0, 1), 4918)).unwrap();
 
         let running = AtomicBool::new(true);
         thread::scope(|s| {
-            let handle = s.spawn(|| start(&server, Some, &dir, &running));
+            let handle = s.spawn(|| start(&server, Some, dir, &running));
 
-            let status = Command::new("./litmus")
+            let status = Command::new("litmus")
                 .current_dir(litmus_dir)
                 .env("TESTS", "http basic copymove locks props")
-                .env("HTDOCS", "htdocs")
-                .env("TESTROOT", ".")
                 .arg("http://localhost:4918/")
                 .arg("someuser")
                 .arg("somepass")

@@ -254,6 +254,12 @@ fn get(root: &Path, relpath: &Path, head: bool) -> Result<ResponseBox, Error> {
 
 fn put(root: &Path, relpath: &Path, body: Vec<u8>) -> Result<ResponseBox, Error> {
     let path = root.join(relpath);
+    if let Some(p) = path.parent() {
+        if !p.exists() {
+            // PUT with missing intermediate -> 409
+            return Err(status::CONFLICT.into());
+        }
+    }
     let mut file = std::fs::File::create(&path)?;
     file.write_all(&body)?;
     Ok(Response::empty(status::CREATED).boxed())
@@ -407,7 +413,7 @@ fn copy(root: &Path, relpath: &Path, headers: &[Header]) -> Result<ResponseBox, 
     let overwrite = headers
         .iter()
         .find(|h| h.field == OVERWRITE)
-        .map_or(false, |v| {
+        .is_some_and(|v| {
             let v = v.value.as_str();
             v.eq_ignore_ascii_case("t") || v == "1"
         });
@@ -458,7 +464,7 @@ fn move_(root: &Path, relpath: &Path, headers: &[Header]) -> Result<ResponseBox,
     let overwrite = headers
         .iter()
         .find(|h| h.field == OVERWRITE)
-        .map_or(false, |v| {
+        .is_some_and(|v| {
             let v = v.value.as_str();
             v.eq_ignore_ascii_case("t") || v == "1"
         });

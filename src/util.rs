@@ -7,6 +7,9 @@ use chrono::{DateTime, Utc};
 use log::error;
 use tiny_http::Header;
 use url::Url;
+use winnow::ascii::dec_uint;
+use winnow::combinator::{alt, opt, preceded};
+use winnow::{ModalResult, Parser};
 
 use crate::dav::DESTINATION;
 
@@ -80,20 +83,50 @@ pub fn http_date_str(time: SystemTime) -> String {
         .to_string()
 }
 
-pub fn byte_range(range: &str, len: u64) -> Option<(u64, u64)> {
-    let (start, end) = range.strip_prefix("bytes=")?.split_once('-')?;
-    if start.is_empty() {
-        let end: u64 = end.parse().ok()?;
-        let start = len.checked_sub(end)?;
-        Some((start, len - 1))
-    } else {
-        let start = start.parse().ok()?;
-        let end = if end.is_empty() {
-            len - 1
-        } else {
-            end.parse().ok()?
+#[derive(Debug, PartialEq, Eq)]
+pub enum ByteRange {
+    Inclusive { start: u64, end: u64 },
+    From(u64),
+    Suffix(u64),
+}
+
+impl ByteRange {
+    pub fn resolve(self, len: u64) -> Option<(u64, u64)> {
+        let last = len.checked_sub(1)?;
+        let (start, end) = match self {
+            Self::Inclusive { start, end } => (start, end),
+            Self::From(start) => (start, last),
+            Self::Suffix(size) => (len.checked_sub(size)?, last),
         };
         (start <= end && end < len).then_some((start, end))
+    }
+}
+
+fn byte_range(input: &mut &str) -> ModalResult<ByteRange> {
+    preceded(
+        "bytes=",
+        alt((
+            preceded('-', dec_uint).map(ByteRange::Suffix),
+            (dec_uint, '-', opt(dec_uint)).map(|(start, _, end)| match end {
+                Some(end) => ByteRange::Inclusive { start, end },
+                None => ByteRange::From(start),
+            }),
+        )),
+    )
+    .parse_next(input)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum UpdateRange {
+    Append,
+    Bytes(ByteRange),
+}
+
+impl UpdateRange {
+    pub fn parse(value: &str) -> Option<Self> {
+        alt(("append".map(|_| Self::Append), byte_range.map(Self::Bytes)))
+            .parse(value)
+            .ok()
     }
 }
 
@@ -101,7 +134,12 @@ pub fn byte_range(range: &str, len: u64) -> Option<(u64, u64)> {
 mod test {
     use std::path::Path;
 
-    use crate::util::{byte_range, url_encode};
+    use crate::util::{url_encode, ByteRange, UpdateRange};
+    use winnow::Parser;
+
+    fn byte_range(value: &str, len: u64) -> Option<(u64, u64)> {
+        super::byte_range.parse(value).ok()?.resolve(len)
+    }
 
     #[test]
     fn url_path() {
@@ -127,5 +165,48 @@ mod test {
         assert_eq!(byte_range("bytes=500-", 500), None);
         assert_eq!(byte_range("bytes=-501", 500), None);
         assert_eq!(byte_range("bytes=0-500", 500), None);
+        assert_eq!(byte_range("bytes=499-0", 500), None);
+        assert_eq!(byte_range("bytes=-0", 500), None);
+        for value in ["bytes=0-", "bytes=-0", "bytes=-1", "bytes=0-0"] {
+            assert_eq!(byte_range(value, 0), None, "{value}");
+        }
+        assert_eq!(byte_range("bytes=0-", u64::MAX), Some((0, u64::MAX - 1)));
+        assert_eq!(
+            byte_range("bytes=-18446744073709551615", u64::MAX),
+            Some((0, u64::MAX - 1))
+        );
+    }
+
+    #[test]
+    fn update_range_syntax() {
+        for (value, expected) in [
+            ("append", UpdateRange::Append),
+            (
+                "bytes=2-4",
+                UpdateRange::Bytes(ByteRange::Inclusive { start: 2, end: 4 }),
+            ),
+            ("bytes=2-", UpdateRange::Bytes(ByteRange::From(2))),
+            ("bytes=-3", UpdateRange::Bytes(ByteRange::Suffix(3))),
+        ] {
+            assert_eq!(UpdateRange::parse(value), Some(expected), "{value}");
+        }
+        for value in [
+            "",
+            "APPEND",
+            "append trailing",
+            "bytes=-",
+            "bytes=+1-2",
+            "bytes=1-+2",
+            "bytes=1--2",
+            "bytes=1-2-3",
+            "bytes=1-2,4-5",
+            "bytes=1-2 trailing",
+            "bytes= 1-2",
+            "bytes=1-2 ",
+            "bytes=18446744073709551616-",
+            "bytes=-18446744073709551616",
+        ] {
+            assert_eq!(UpdateRange::parse(value), None, "{value}");
+        }
     }
 }

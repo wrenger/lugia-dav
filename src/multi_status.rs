@@ -3,11 +3,10 @@ use std::{fs::Metadata, path::Path};
 use serde::{Serialize, Serializer};
 use tiny_http::StatusCode;
 
-use crate::{
-    dav::Error,
-    status,
-    util::{date_str, http_date_str, url_encode},
-};
+use crate::conditional::file_etag;
+use crate::dav::Error;
+use crate::status;
+use crate::util::{date_str, http_date_str, url_encode};
 
 #[derive(Serialize, Debug)]
 #[serde(rename = "multistatus")]
@@ -62,6 +61,7 @@ enum PropKind {
     DisplayName(String),
     GetContentLength(u64),
     GetContentType(String),
+    GetEtag(String),
     GetLastModified(String),
     ResourceType(Option<PropCollection>),
 }
@@ -72,6 +72,7 @@ impl PropKind {
             Self::CreationDate(value)
             | Self::DisplayName(value)
             | Self::GetContentType(value)
+            | Self::GetEtag(value)
             | Self::GetLastModified(value) => value.clear(),
             Self::GetContentLength(value) => *value = 0,
             Self::ResourceType(value) => *value = None,
@@ -84,6 +85,7 @@ impl PropKind {
             Self::DisplayName(_) => "displayname",
             Self::GetContentLength(_) => "getcontentlength",
             Self::GetContentType(_) => "getcontenttype",
+            Self::GetEtag(_) => "getetag",
             Self::GetLastModified(_) => "getlastmodified",
             Self::ResourceType(_) => "resourcetype",
         }
@@ -96,7 +98,12 @@ struct PropCollection {
 }
 
 impl PropResponse {
-    pub fn new(path: &Path, meta: &Metadata, base: &Path) -> Result<Self, Error> {
+    pub fn new(
+        path: &Path,
+        meta: &Metadata,
+        base: &Path,
+        include_etag: bool,
+    ) -> Result<Self, Error> {
         let display = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -126,6 +133,11 @@ impl PropResponse {
                             PropKind::DisplayName(display),
                             PropKind::GetContentLength(meta.len()),
                             PropKind::GetContentType(mime),
+                            PropKind::GetEtag(if include_etag {
+                                file_etag(meta)
+                            } else {
+                                String::new()
+                            }),
                             PropKind::ResourceType(None),
                             PropKind::GetLastModified(http_date_str(meta.modified()?)),
                         ]
@@ -163,7 +175,7 @@ mod test {
         let path = Path::new("src/");
         let base = Path::new("");
         let meta = path.metadata().unwrap();
-        let res = PropResponse::new(path, &meta, base).unwrap();
+        let res = PropResponse::new(path, &meta, base, true).unwrap();
         let xml = quick_xml::se::to_string(&res).unwrap();
         println!("{res:?}");
         println!("{xml}");

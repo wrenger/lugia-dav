@@ -11,6 +11,7 @@ use log::{info, trace};
 use sha2::{Digest, Sha256};
 use tiny_http::{Header, Request, Response, Server, SslConfig};
 
+mod conditional;
 mod dav;
 mod multi_status;
 mod util;
@@ -22,6 +23,7 @@ mod status {
     pub const CREATED: StatusCode = StatusCode(201);
     pub const NO_CONTENT: StatusCode = StatusCode(204);
     pub const MULTI_STATUS: StatusCode = StatusCode(207);
+    pub const NOT_MODIFIED: StatusCode = StatusCode(304);
 
     pub const BAD_REQUEST: StatusCode = StatusCode(400);
     pub const UNAUTHORIZED: StatusCode = StatusCode(401);
@@ -97,7 +99,7 @@ fn start(
                 for rq in server.incoming_requests() {
                     if let Some(mut rq) = authenticate(rq) {
                         let _ = match dav::handle(dir, &mut rq) {
-                            Ok(res) => rq.respond(res),
+                            Ok(res) => res.respond(rq),
                             Err(e) => {
                                 let res = e.response(&rq);
                                 rq.respond(res)
@@ -173,7 +175,7 @@ mod test {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
 
-    use log::info;
+    use log::{info, warn};
     use tiny_http::Server;
 
     use crate::start;
@@ -185,6 +187,7 @@ mod test {
 
         let dir = Path::new("tmp");
         create_dir_all(dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
 
         let litmus_dir = Path::new("litmus");
         create_dir_all(litmus_dir).unwrap();
@@ -193,7 +196,7 @@ mod test {
 
         let running = AtomicBool::new(true);
         thread::scope(|s| {
-            let handle = s.spawn(|| start(&server, Some, dir, &running));
+            let handle = s.spawn(|| start(&server, Some, &dir, &running));
 
             let status = Command::new("litmus")
                 .current_dir(litmus_dir)
@@ -201,12 +204,7 @@ mod test {
                 .arg("http://localhost:4918/")
                 .arg("someuser")
                 .arg("somepass")
-                .status()
-                .expect("litmus failed");
-
-            if !status.success() {
-                log::warn!("Localfs might not complete litmus");
-            }
+                .status();
 
             running.store(false, Ordering::Relaxed);
 
@@ -215,7 +213,11 @@ mod test {
             }
             handle.join().unwrap();
 
-            std::fs::remove_dir_all("tmp").unwrap();
+            std::fs::remove_dir_all(&dir).unwrap();
+            let status = status.expect("failed to run litmus");
+            if !status.success() {
+                warn!("litmus failed: {status}");
+            }
         })
     }
 }

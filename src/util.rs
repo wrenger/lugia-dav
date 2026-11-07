@@ -134,7 +134,7 @@ impl UpdateRange {
 mod test {
     use std::path::Path;
 
-    use crate::util::{url_encode, ByteRange, UpdateRange};
+    use crate::util::{ByteRange, UpdateRange, url_encode};
     use winnow::Parser;
 
     fn byte_range(value: &str, len: u64) -> Option<(u64, u64)> {

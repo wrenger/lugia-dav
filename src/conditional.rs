@@ -1,13 +1,13 @@
 use std::fs::{self, Metadata};
 use std::io;
 use std::path::Path;
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use chrono::{DateTime, Utc};
 use tiny_http::{Header, Method, StatusCode};
 use url::Url;
-use winnow::ascii::{space0, Caseless};
+use winnow::ascii::{Caseless, space0};
 use winnow::combinator::{alt, delimited, opt, preceded, repeat, separated, terminated};
+use winnow::stream::AsChar;
 use winnow::token::take_while;
 use winnow::{ModalResult, Parser};
 
@@ -40,11 +40,52 @@ impl ResourceState {
                 modified: None,
             });
         }
+
         Ok(Self {
             exists: true,
             etag: Some(file_etag(&metadata)),
             modified: Some(metadata.modified()?),
         })
+    }
+
+    fn modified(&self) -> Option<u64> {
+        if self.exists {
+            self.modified.map(|t| {
+                t.duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or_default()
+            })
+        } else {
+            None
+        }
+    }
+
+    fn current_tag(&self) -> Option<EntityTag<'_>> {
+        if self.exists {
+            entity_tag.parse(self.etag.as_deref()?).ok()
+        } else {
+            None
+        }
+    }
+
+    fn matches_tag(&self, tag: &EntityTag<'_>, strong: bool) -> bool {
+        self.current_tag().is_some_and(|current| {
+            current.opaque == tag.opaque && (!strong || (!current.weak && !tag.weak))
+        })
+    }
+
+    fn matches_tags(&self, list: &TagList<'_>, strong: bool) -> bool {
+        match list {
+            TagList::Any => self.exists,
+            TagList::Tags(tags) => tags.iter().any(|tag| self.matches_tag(tag, strong)),
+        }
+    }
+
+    fn matches(&self, condition: &Condition<'_>) -> bool {
+        match condition {
+            Condition::Token(_) => false, // No locking for now
+            Condition::Tag(tag) => self.matches_tag(tag, true),
+        }
     }
 }
 
@@ -52,7 +93,7 @@ pub fn file_etag(meta: &Metadata) -> String {
     let mtime = meta
         .modified()
         .ok()
-        .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
     format!("\"{mtime:x}-{:x}\"", meta.len())
@@ -62,6 +103,11 @@ pub fn file_etag(meta: &Metadata) -> String {
 struct EntityTag<'a> {
     weak: bool,
     opaque: &'a str,
+}
+impl<'a> EntityTag<'a> {
+    fn new(weak: bool, opaque: &'a str) -> Self {
+        Self { weak, opaque }
+    }
 }
 
 fn entity_tag<'a>(input: &mut &'a str) -> ModalResult<EntityTag<'a>> {
@@ -73,10 +119,7 @@ fn entity_tag<'a>(input: &mut &'a str) -> ModalResult<EntityTag<'a>> {
             '"',
         ),
     )
-        .map(|(weak, opaque)| EntityTag {
-            weak: weak.is_some(),
-            opaque,
-        })
+        .map(|(weak, opaque)| EntityTag::new(weak.is_some(), opaque))
         .parse_next(input)
 }
 
@@ -89,22 +132,6 @@ fn coded_url<'a>(input: &mut &'a str) -> ModalResult<&'a str> {
     .parse_next(input)
 }
 
-fn bad() -> Error {
-    status::BAD_REQUEST.into()
-}
-
-fn current_tag(state: &ResourceState) -> Option<EntityTag<'_>> {
-    if !state.exists {
-        return None;
-    }
-    entity_tag.parse(state.etag.as_deref()?).ok()
-}
-fn matches_tag(state: &ResourceState, tag: &EntityTag<'_>, strong: bool) -> bool {
-    current_tag(state).is_some_and(|current| {
-        current.opaque == tag.opaque && (!strong || (!current.weak && !tag.weak))
-    })
-}
-
 enum TagList<'a> {
     Any,
     Tags(Vec<EntityTag<'a>>),
@@ -114,35 +141,41 @@ fn tag_list(value: &str) -> Result<TagList<'_>, Error> {
         space0,
         alt((
             "*".map(|_| TagList::Any),
-            separated(1.., opt(entity_tag), delimited(space0, ',', space0))
+            separated(1.., opt(entity_tag), (space0, ',', space0))
                 .map(|tags: Vec<_>| TagList::Tags(tags.into_iter().flatten().collect())),
         )),
         space0,
     )
     .parse(value)
-    .map_err(|_| bad())
-}
-fn list_matches(list: &TagList<'_>, state: &ResourceState, strong: bool) -> bool {
-    match list {
-        TagList::Any => state.exists,
-        TagList::Tags(tags) => tags.iter().any(|tag| matches_tag(state, tag, strong)),
-    }
+    .map_err(|_| status::BAD_REQUEST.into())
 }
 
 #[derive(Debug)]
 enum Condition<'a> {
-    Token,
+    Token(#[allow(dead_code)] &'a str),
     Tag(EntityTag<'a>),
 }
+
 #[derive(Debug)]
 struct Test<'a> {
     not: bool,
     condition: Condition<'a>,
 }
+impl<'a> Test<'a> {
+    fn new(not: bool, condition: Condition<'a>) -> Self {
+        Self { not, condition }
+    }
+}
+
 #[derive(Debug)]
 struct Group<'a> {
     resource: Option<&'a str>,
     lists: Vec<Vec<Test<'a>>>,
+}
+impl<'a> Group<'a> {
+    fn new(resource: Option<&'a str>, lists: Vec<Vec<Test<'a>>>) -> Self {
+        Self { resource, lists }
+    }
 }
 
 fn uri_characters(input: &mut &str) -> ModalResult<()> {
@@ -152,7 +185,7 @@ fn uri_characters(input: &mut &str) -> ModalResult<()> {
             take_while(1.., |c: char| {
                 c.is_ascii_alphanumeric() || "-._~:/?#[]@!$&'()*+,;=".contains(c)
             }),
-            ('%', take_while(2, |c: char| c.is_ascii_hexdigit())).take(),
+            ('%', take_while(2, AsChar::is_hex_digit)).take(),
         )),
     )
     .parse_next(input)
@@ -172,14 +205,11 @@ fn condition<'a>(input: &mut &'a str) -> ModalResult<Test<'a>> {
     (
         opt(terminated(Caseless("Not"), space0)),
         alt((
-            coded_url.verify(absolute_uri).map(|_| Condition::Token),
+            coded_url.verify(absolute_uri).map(Condition::Token),
             delimited('[', entity_tag, ']').map(Condition::Tag),
         )),
     )
-        .map(|(not, condition)| Test {
-            not: not.is_some(),
-            condition,
-        })
+        .map(|(not, condition)| Test::new(not.is_some(), condition))
         .parse_next(input)
 }
 
@@ -197,10 +227,7 @@ fn tagged_group<'a>(input: &mut &'a str) -> ModalResult<Group<'a>> {
         terminated(coded_url.verify(resource_tag), space0),
         repeat(1.., terminated(condition_list, space0)),
     )
-        .map(|(resource, lists)| Group {
-            resource: Some(resource),
-            lists,
-        })
+        .map(|(resource, lists)| Group::new(Some(resource), lists))
         .parse_next(input)
 }
 
@@ -209,16 +236,12 @@ fn dav_if(value: &str) -> Result<Vec<Group<'_>>, Error> {
         space0,
         alt((
             repeat(1.., tagged_group),
-            repeat(1.., terminated(condition_list, space0)).map(|lists| {
-                vec![Group {
-                    resource: None,
-                    lists,
-                }]
-            }),
+            repeat(1.., terminated(condition_list, space0))
+                .map(|lists| vec![Group::new(None, lists)]),
         )),
     )
     .parse(value)
-    .map_err(|_| bad())
+    .map_err(|_| status::BAD_REQUEST.into())
 }
 
 fn headers<'a>(headers: &'a [Header], name: &'static str) -> Vec<&'a str> {
@@ -228,25 +251,19 @@ fn headers<'a>(headers: &'a [Header], name: &'static str) -> Vec<&'a str> {
         .map(|h| h.value.as_str())
         .collect()
 }
-fn date(value: &str) -> Option<i64> {
-    httpdate::parse_http_date(value.trim())
-        .ok()
-        .map(|time| DateTime::<Utc>::from(time).timestamp())
+fn date(value: &str) -> Option<u64> {
+    httpdate::parse_http_date(value.trim()).ok().map(|t| {
+        t.duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default()
+    })
 }
-fn single_date(values: &[&str]) -> Option<i64> {
+fn single<T>(f: impl Fn(&str) -> Option<T>, values: &[&str]) -> Option<T> {
     if values.len() == 1 {
-        date(values[0])
+        f(values[0])
     } else {
         None
     }
-}
-fn modified(state: &ResourceState) -> Option<i64> {
-    if !state.exists {
-        return None;
-    }
-    state
-        .modified
-        .map(|time| DateTime::<Utc>::from(time).timestamp())
 }
 
 pub fn evaluate(
@@ -257,23 +274,26 @@ pub fn evaluate(
 ) -> Result<Option<StatusCode>, Error> {
     let dav = headers(request_headers, "If");
     if dav.len() > 1 {
-        return Err(bad());
+        return Err(status::BAD_REQUEST.into());
     }
     let parsed_dav = dav.first().map(|value| dav_if(value)).transpose()?;
+
     let if_match = headers(request_headers, "If-Match");
-    let if_none = headers(request_headers, "If-None-Match");
     let match_value = if_match.join(",");
-    let none_value = if_none.join(",");
-    let match_list = if if_match.is_empty() {
-        None
-    } else {
+    let match_list = if !if_match.is_empty() {
         Some(tag_list(&match_value)?)
-    };
-    let none_list = if if_none.is_empty() {
-        None
     } else {
-        Some(tag_list(&none_value)?)
+        None
     };
+
+    let if_none = headers(request_headers, "If-None-Match");
+    let none_value = if_none.join(",");
+    let none_list = if !if_none.is_empty() {
+        Some(tag_list(&none_value)?)
+    } else {
+        None
+    };
+
     if let Some(groups) = parsed_dav {
         let mut matched = false;
         for group in groups {
@@ -285,13 +305,8 @@ pub fn evaluate(
                 state
             };
             if group.lists.iter().any(|list| {
-                list.iter().all(|test| {
-                    let result = match &test.condition {
-                        Condition::Token => false,
-                        Condition::Tag(tag) => matches_tag(target, tag, true),
-                    };
-                    result != test.not
-                })
+                list.iter()
+                    .all(|test| target.matches(&test.condition) != test.not)
             }) {
                 matched = true;
             }
@@ -301,35 +316,33 @@ pub fn evaluate(
         }
     }
     if let Some(list) = match_list {
-        if !list_matches(&list, state, true) {
+        if !state.matches_tags(&list, true) {
             return Ok(Some(status::PRECONDITION_FAILED));
         }
     } else if let (Some(m), Some(d)) = (
-        modified(state),
-        single_date(&headers(request_headers, "If-Unmodified-Since")),
-    ) {
-        if m > d {
-            return Ok(Some(status::PRECONDITION_FAILED));
-        }
+        state.modified(),
+        single(date, &headers(request_headers, "If-Unmodified-Since")),
+    ) && m > d
+    {
+        return Ok(Some(status::PRECONDITION_FAILED));
     }
     let safe = matches!(method, Method::Get | Method::Head);
     if let Some(list) = none_list {
-        if list_matches(&list, state, false) {
+        if state.matches_tags(&list, false) {
             return Ok(Some(if safe {
                 status::NOT_MODIFIED
             } else {
                 status::PRECONDITION_FAILED
             }));
         }
-    } else if safe {
-        if let (Some(m), Some(d)) = (
-            modified(state),
-            single_date(&headers(request_headers, "If-Modified-Since")),
-        ) {
-            if m <= d {
-                return Ok(Some(status::NOT_MODIFIED));
-            }
-        }
+    } else if safe
+        && let (Some(m), Some(d)) = (
+            state.modified(),
+            single(date, &headers(request_headers, "If-Modified-Since")),
+        )
+        && m <= d
+    {
+        return Ok(Some(status::NOT_MODIFIED));
     }
     Ok(None)
 }
@@ -337,13 +350,13 @@ pub fn evaluate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::{fs::File, time::Duration};
 
     fn state(exists: bool, etag: Option<&str>, time: Option<u64>) -> ResourceState {
         ResourceState {
             exists,
             etag: etag.map(str::to_owned),
-            modified: time.map(|s| SystemTime::UNIX_EPOCH + Duration::from_secs(s)),
+            modified: time.map(|s| UNIX_EPOCH + Duration::from_secs(s)),
         }
     }
     fn check(
@@ -381,24 +394,18 @@ mod tests {
         assert!(collection.exists && collection.etag.is_none() && collection.modified.is_none());
         assert!(!ResourceState::read(&dir.join("missing")).unwrap().exists);
 
-        let mtime = SystemTime::UNIX_EPOCH;
-        std::fs::File::open(&path)
-            .unwrap()
-            .set_modified(mtime)
-            .unwrap();
+        let mtime = UNIX_EPOCH;
+        File::open(&path).unwrap().set_modified(mtime).unwrap();
         let etag = ResourceState::read(&path).unwrap().etag;
-        std::fs::File::open(&path)
-            .unwrap()
-            .set_modified(mtime)
-            .unwrap();
+        File::open(&path).unwrap().set_modified(mtime).unwrap();
         assert_eq!(ResourceState::read(&path).unwrap().etag, etag);
-        std::fs::File::open(&path)
+        File::open(&path)
             .unwrap()
             .set_modified(mtime + Duration::from_secs(1))
             .unwrap();
         assert_ne!(ResourceState::read(&path).unwrap().etag, etag);
         std::fs::write(&path, b"abcd").unwrap();
-        std::fs::File::open(&path)
+        File::open(&path)
             .unwrap()
             .set_modified(mtime + Duration::from_secs(1))
             .unwrap();
@@ -694,17 +701,21 @@ mod tests {
                 "{value}"
             );
         }
-        assert!(check(
-            Method::Get,
-            &[("If", "([\"x\"])"), ("If", "([\"x\"])")],
-            &file
-        )
-        .is_err());
-        assert!(check(
-            Method::Get,
-            &[("If-Match", "\"wrong\""), ("If", "()")],
-            &file
-        )
-        .is_err());
+        assert!(
+            check(
+                Method::Get,
+                &[("If", "([\"x\"])"), ("If", "([\"x\"])")],
+                &file
+            )
+            .is_err()
+        );
+        assert!(
+            check(
+                Method::Get,
+                &[("If-Match", "\"wrong\""), ("If", "()")],
+                &file
+            )
+            .is_err()
+        );
     }
 }

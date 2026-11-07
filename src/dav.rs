@@ -4,16 +4,17 @@ use std::io::{ErrorKind, SeekFrom};
 use std::path::Path;
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+use facet::Facet;
+use facet_xml::{self as xml, XmlError};
 use log::{debug, error, info, warn};
-use maud::{html, Markup};
-use serde::{Deserialize, Serialize};
+use maud::{Markup, html};
 use std::fs::DirEntry;
 use tiny_http::{Header, HeaderField, Method, Request, Response, ResponseBox, StatusCode};
 
 use crate::conditional::{self, ResourceState};
 use crate::multi_status::{MultiStatus, PropResponse};
 use crate::status;
-use crate::util::{header_destination, parse_path, safe_join, url_encode, UpdateRange};
+use crate::util::{UpdateRange, header_destination, parse_path, safe_join, url_encode};
 
 const MAX_FILE_SIZE: usize = 1 << 30; // 1GiB
 
@@ -73,15 +74,15 @@ impl From<io::Error> for Error {
         Self::Io(e)
     }
 }
-impl From<quick_xml::DeError> for Error {
-    fn from(e: quick_xml::DeError) -> Self {
-        error!("Parse: {e:?}");
+impl From<facet_xml::SerializeError<facet_xml::XmlSerializeError>> for Error {
+    fn from(e: facet_xml::SerializeError<facet_xml::XmlSerializeError>) -> Self {
+        error!("XML Serialize: {e:?}");
         Self::Xml
     }
 }
-impl From<quick_xml::SeError> for Error {
-    fn from(e: quick_xml::SeError) -> Self {
-        error!("Serialize: {e:?}");
+impl From<facet_xml::DeserializeError<XmlError>> for Error {
+    fn from(e: facet_xml::DeserializeError<XmlError>) -> Self {
+        error!("XML Deserialize: {e:?}");
         Self::Xml
     }
 }
@@ -432,11 +433,11 @@ fn put(root: &Path, relpath: &Path, body: Vec<u8>) -> Result<ResponseBox, Error>
         return Err(status::METHOD_NOT_ALLOWED.into());
     }
     let existed = path.exists();
-    if let Some(p) = path.parent() {
-        if !p.exists() {
-            // PUT with missing intermediate -> 409
-            return Err(status::CONFLICT.into());
-        }
+    if let Some(p) = path.parent()
+        && !p.exists()
+    {
+        // PUT with missing intermediate -> 409
+        return Err(status::CONFLICT.into());
     }
     let mut file = std::fs::File::create(&path)?;
     file.write_all(&body)?;
@@ -571,7 +572,7 @@ fn propfind(
 
     let out = format!(
         "<?xml version=\"1.0\" encoding=\"utf-8\" ?>{}",
-        quick_xml::se::to_string(&out)?
+        facet_xml::to_string(&out)?
     );
     Ok(Response::from_string(out)
         .with_header(Header::from_bytes(CONTENT_TYPE.0, b"text/xml; charset=\"utf-8\"").unwrap())
@@ -585,7 +586,7 @@ fn parse_propfind(body: &[u8]) -> Result<PropFind, Error> {
     } else {
         let body = std::str::from_utf8(body).map_err(|_| Error::Xml)?;
         info!("{body}");
-        Ok(quick_xml::de::from_str(body)?)
+        Ok(facet_xml::from_str(body)?)
     }
 }
 
@@ -814,18 +815,19 @@ fn read_dir_rec(path: &Path, depth: usize) -> Result<Vec<DirEntry>, io::Error> {
     }
 }
 
-#[derive(Deserialize, Serialize, Debug, Default)]
-#[serde(rename = "propfind")]
+#[derive(Facet, Debug, Default)]
+#[facet(rename = "propfind")]
 struct PropFind {
-    #[serde(rename = "$value")]
+    #[facet(flatten)]
     propfind: PropFindInner,
 }
 
-#[derive(Deserialize, Serialize, Debug, Default)]
-#[serde(rename_all = "lowercase")]
+#[derive(Facet, Debug, Default)]
+#[facet(rename_all = "lowercase")]
+#[repr(u8)]
 enum PropFindInner {
     Prop {
-        #[serde(rename = "$value")]
+        #[facet(flatten, default)]
         props: Vec<PropFindKind>,
     },
     PropName,
@@ -833,8 +835,9 @@ enum PropFindInner {
     AllProp,
 }
 
-#[derive(Deserialize, Serialize, Debug)]
-#[serde(rename_all = "lowercase")]
+#[derive(Facet, Debug)]
+#[facet(rename_all = "lowercase")]
+#[repr(u8)]
 enum PropFindKind {
     CreationDate,
     DisplayName,
@@ -843,7 +846,7 @@ enum PropFindKind {
     GetContentType,
     GetEtag,
     GetLastModified,
-    #[serde(other, skip_serializing)]
+    #[facet(xml::custom_element, skip_serializing)]
     Other,
 }
 
@@ -864,6 +867,8 @@ impl PropFindKind {
 
 #[cfg(test)]
 mod test {
+    use rediff::assert_same;
+
     use crate::dav::PropFind;
 
     #[cfg(unix)]
@@ -977,8 +982,43 @@ mod test {
             <bar xmlns="http://example.com/neon/litmus/"/>
             </prop></propfind>"#;
 
-        let propfind: PropFind = quick_xml::de::from_str(xml).unwrap();
-        println!("{propfind:?}");
+        let propfind: PropFind = facet_xml::from_str(xml).unwrap();
+        assert_same!(
+            propfind.propfind,
+            super::PropFindInner::Prop {
+                props: vec![
+                    super::PropFindKind::GetContentLength,
+                    super::PropFindKind::GetLastModified,
+                    super::PropFindKind::DisplayName,
+                    super::PropFindKind::ResourceType,
+                    super::PropFindKind::Other,
+                    super::PropFindKind::Other,
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn propfind_request_forms() {
+        for body in [
+            "",
+            r#"<propfind xmlns="DAV:"><allprop/></propfind>"#,
+            r#"<D:propfind xmlns:D="DAV:"><D:allprop/></D:propfind>"#,
+        ] {
+            let request = super::parse_propfind(body.as_bytes()).unwrap();
+            assert_same!(request.propfind, super::PropFindInner::AllProp);
+        }
+        let request =
+            super::parse_propfind(br#"<D:propfind xmlns:D="DAV:"><D:propname/></D:propfind>"#)
+                .unwrap();
+        assert_same!(request.propfind, super::PropFindInner::PropName);
+
+        let request =
+            super::parse_propfind(br#"<D:propfind xmlns:D="DAV:"><D:prop/></D:propfind>"#).unwrap();
+        assert_same!(
+            request.propfind,
+            super::PropFindInner::Prop { props: Vec::new() }
+        );
     }
 
     #[test]

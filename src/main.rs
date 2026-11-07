@@ -5,7 +5,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, available_parallelism};
 
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use clap::Parser;
 use log::{info, trace};
 use sha2::{Digest, Sha256};

@@ -1,4 +1,3 @@
-use std::convert::Infallible;
 use std::{fs::Metadata, path::Path};
 
 use facet::Facet;
@@ -49,14 +48,13 @@ struct PropStat {
 #[derive(Facet, Debug)]
 #[facet(transparent)]
 struct StatusCodeProxy(String);
-impl TryFrom<&StatusCode> for StatusCodeProxy {
-    type Error = Infallible;
-    fn try_from(value: &StatusCode) -> Result<Self, Self::Error> {
-        Ok(Self(format!(
+impl From<&StatusCode> for StatusCodeProxy {
+    fn from(value: &StatusCode) -> Self {
+        Self(format!(
             "HTTP/1.1 {} {}",
             value.0,
             value.default_reason_phrase()
-        )))
+        ))
     }
 }
 impl TryFrom<StatusCodeProxy> for StatusCode {

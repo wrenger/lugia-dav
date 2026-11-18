@@ -354,8 +354,8 @@ fn get(root: &Path, relpath: &Path) -> Result<ResponseBox, Error> {
                         meta charset="utf-8";
                         title { (title) }
                         meta viewport="width=device-width, initial-scale=1";
-                        style { ("@media(prefers-color-scheme: dark) { body { background-color: black; } }") }
-                        link rel="stylesheet" href="https://cdn.simplecss.org/simple.min.css";
+                        link rel="stylesheet" href="https://unpkg.com/sakura.css/css/sakura.css" media="screen";
+                        link rel="stylesheet" href="https://unpkg.com/sakura.css/css/sakura-dark.css" media="screen and (prefers-color-scheme: dark)";
                     }
                     body { (body) }
                 }
